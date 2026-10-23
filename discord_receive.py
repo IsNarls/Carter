@@ -119,6 +119,8 @@ class _KeepAlive(UDPKeepAlive):
 
 
 class _ReceiveReader(AudioReader):
+    WORKER_JOIN_TIMEOUT = 0.5
+
     def __init__(self, sink, voice_client, *, after=None):
         super().__init__(sink, voice_client, after=after)
         self.keepalive = _KeepAlive(voice_client)
@@ -130,10 +132,11 @@ class _ReceiveReader(AudioReader):
         finally:
             for worker in (self.packet_router, self.event_router, self.speaking_timer, self.keepalive):
                 if worker.ident is not None and worker is not threading.current_thread():
-                    # This cleanup runs in its own thread. A stuck old router
-                    # must keep a new session blocked; the async caller has a
-                    # timeout while waiting for the stopped event.
-                    worker.join()
+                    # The upstream stopper is a non-daemon thread. Never let a
+                    # stuck third-party worker prevent interpreter shutdown;
+                    # wait_receive_cleanup still prevents a new receiver from
+                    # starting until this bounded cleanup finishes.
+                    worker.join(timeout=self.WORKER_JOIN_TIMEOUT)
             self.stopped.set()
 
 

@@ -26,7 +26,7 @@ class FakeProvider:
 
     def __init__(self, connect_error=None):
         self.connect_error = connect_error
-        self.connects = self.closes = self.ends = 0
+        self.connects = self.closes = self.starts = self.ends = 0
         self.sent = []
         self.events = asyncio.Queue()
 
@@ -37,6 +37,9 @@ class FakeProvider:
 
     async def send_audio(self, pcm):
         self.sent.append(pcm)
+
+    async def start_audio(self):
+        self.starts += 1
 
     async def end_audio(self):
         self.ends += 1
@@ -142,12 +145,28 @@ class VoiceSessionTests(unittest.IsolatedAsyncioTestCase):
         session.capture(42, b"wrong frame size")
         session.capture(42, MIC_FRAME)
         await eventually(lambda: len(provider.sent) == 1)
+        self.assertEqual(provider.starts, 1)
         self.assertEqual(len(provider.sent[0]), 640)
         self.assertAlmostEqual(session.input_seconds, 0.02)
         self.assertEqual(session.owner_id, 42)
+        self.assertEqual(session.rejected_speaker_frames, 1)
         with self.assertRaises(RuntimeError):
             await session.start(voice, 43)
         self.assertEqual(factory.names, ["gemini"])
+        await eventually(lambda: provider.ends == 1, timeout=1.2)
+
+    async def test_seed_audio_requires_explicit_matching_owner(self):
+        provider, voice = FakeProvider(), FakeVoice()
+        session, _ = self.make(provider)
+        voice.listening = True  # The shared wake receiver owns capture in this mode.
+        await session.start(voice, 42, self.notice, external_capture=True)
+        now = time.monotonic()
+        session.seed_audio([(now, MIC_FRAME)])
+        session.seed_audio([(now, MIC_FRAME)], source_user_id=43)
+        await REAL_SLEEP(0.03)
+        self.assertEqual(provider.sent, [])
+        session.seed_audio([(time.monotonic(), MIC_FRAME)], source_user_id=42)
+        await eventually(lambda: len(provider.sent) == 1)
 
     async def test_generated_audio_turn_and_usage_become_playable(self):
         provider = FakeProvider()

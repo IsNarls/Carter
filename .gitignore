@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .carter.lock
 models/
+.carter_data/

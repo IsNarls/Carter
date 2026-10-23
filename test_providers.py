@@ -11,7 +11,7 @@ from google.genai import types
 
 from providers import (
     GeminiProvider, OpenAIProvider, ProviderError, ProviderSettings,
-    _provider_error, create_provider,
+    _provider_error, create_provider, generate_text,
 )
 
 
@@ -97,19 +97,70 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         config = types.LiveConnectConfig.model_validate(arguments["config"])
         self.assertEqual(arguments["model"], self.settings.gemini_model)
         self.assertEqual(config.max_output_tokens, 512)
-        self.assertFalse(config.realtime_input_config.automatic_activity_detection.disabled)
+        self.assertEqual(config.speech_config.language_code, "en")
+        self.assertTrue(config.realtime_input_config.automatic_activity_detection.disabled)
+        await provider.start_audio()
+        self.assertIsNotNone(session.send_realtime_input.call_args.kwargs["activity_start"])
         await provider.send_audio(b"\x01\x00")
         blob = session.send_realtime_input.call_args.kwargs["audio"]
         self.assertEqual(blob.mime_type, "audio/pcm;rate=16000")
         self.assertEqual(blob.data, b"\x01\x00")
         await provider.end_audio()
-        session.send_realtime_input.assert_awaited_with(audio_stream_end=True)
+        self.assertIsNotNone(session.send_realtime_input.call_args.kwargs["activity_end"])
         with self.assertRaisesRegex(ProviderError, "invalid_pcm"):
             await provider.send_audio(b"\x01")
         await provider.close()
         await provider.close()
         context.__aexit__.assert_awaited_once()
         client.aio.aclose.assert_awaited_once()
+
+    async def test_gemini_text_turn_returns_text_and_cleans_up(self):
+        response = SimpleNamespace(text="Carter reply")
+        client = SimpleNamespace(aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=AsyncMock(return_value=response)),
+            aclose=AsyncMock(),
+        ))
+        modules = (SimpleNamespace(Client=Mock(return_value=client)), types)
+        with patch("providers._gemini_modules", return_value=modules):
+            answer = await generate_text(self.settings, "private prompt")
+        self.assertEqual(answer, "Carter reply")
+        call = client.aio.models.generate_content.await_args.kwargs
+        self.assertEqual(call["model"], self.settings.gemini_text_model)
+        self.assertEqual(call["contents"], "private prompt")
+        self.assertEqual(call["config"]["system_instruction"], self.settings.instructions)
+        client.aio.aclose.assert_awaited_once()
+
+    async def test_gemini_text_empty_response_is_sanitized(self):
+        client = SimpleNamespace(aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=AsyncMock(
+                return_value=SimpleNamespace(text=None),
+            )),
+            aclose=AsyncMock(),
+        ))
+        modules = (SimpleNamespace(Client=Mock(return_value=client)), types)
+        with patch("providers._gemini_modules", return_value=modules):
+            with self.assertRaisesRegex(ProviderError, "empty_response"):
+                await generate_text(self.settings, "prompt")
+
+    async def test_gemini_text_retries_one_transient_failure(self):
+        class TemporaryError(Exception):
+            code = 503
+
+        generate = AsyncMock(side_effect=[
+            TemporaryError("private upstream detail"),
+            SimpleNamespace(text="Recovered reply"),
+        ])
+        client = SimpleNamespace(aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=generate), aclose=AsyncMock(),
+        ))
+        modules = (SimpleNamespace(Client=Mock(return_value=client)), types)
+        with patch("providers._gemini_modules", return_value=modules), \
+                patch("providers.asyncio.sleep", AsyncMock()) as sleep:
+            answer = await generate_text(self.settings, "prompt")
+        self.assertEqual(answer, "Recovered reply")
+        self.assertEqual(generate.await_count, 2)
+        self.assertEqual(client.aio.aclose.await_count, 2)
+        sleep.assert_awaited_once_with(1)
 
     async def test_gemini_receives_multiple_turns_and_interruption(self):
         session, _, _, modules = self.gemini_transport()
@@ -172,6 +223,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(setup["session"]["audio"]["input"]["turn_detection"]["interrupt_response"])
         await provider.send_audio(b"\x01\x00")
         self.assertEqual(base64.b64decode(ws.send_json.call_args.args[0]["audio"]), b"\x01\x00")
+        await provider.start_audio()
         await provider.end_audio()
         self.assertEqual(len(base64.b64decode(ws.send_json.call_args.args[0]["audio"])), 28800)
         calls = ws.send_json.await_count

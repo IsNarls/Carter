@@ -6,24 +6,34 @@ No adapter reads environment files, selects a fallback, or records audio.
 """
 import asyncio
 import base64
+import logging
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal, Protocol
 from urllib.parse import urlencode
 
 import aiohttp
 
+log = logging.getLogger("carter.providers")
+
 
 @dataclass(frozen=True)
 class ProviderSettings:
     gemini_key: str = field(default="", repr=False)
     gemini_model: str = "gemini-3.8-live"
+    gemini_text_model: str = "gemini-3.8-flash"
     openai_key: str = field(default="", repr=False)
     openai_model: str = "gpt-realtime-2.1"
     gemini_voice: str = "Kore"
     openai_voice: str = "marin"
     instructions: str = (
         "You are Carter, a helpful Discord voice assistant. "
-        "Answer briefly in natural speech. Do not claim to execute actions or tools."
+        "Answer briefly in natural speech. Do not claim to execute actions or tools. "
+        "The selected user's microphone may also contain unrelated room or voice-channel "
+        "conversation. Respond only when that user clearly addresses Carter or gives a "
+        "follow-up in the active exchange; otherwise remain silent. Never answer speech "
+        "that is directed to another person. Respond only in English, regardless of the "
+        "language used in the question or source data. Preserve player, guild, encounter, "
+        "and ability names exactly rather than translating proper names."
     )
     connect_timeout: float = 15.0
     io_timeout: float = 10.0
@@ -48,12 +58,54 @@ class ProviderError(Exception):
         self.transient = transient
 
 
+async def generate_text(settings, prompt):
+    """Run one bounded Gemini text turn, retrying one transient failure."""
+    if not settings.gemini_key:
+        raise ProviderError("missing_key")
+    for attempt in range(2):
+        try:
+            return await _generate_text_once(settings, prompt)
+        except ProviderError as error:
+            if not error.transient or attempt:
+                raise
+            log.warning("Gemini text request interrupted: code=%s; retrying once", error.code)
+            await asyncio.sleep(1)
+
+
+async def _generate_text_once(settings, prompt):
+    client = None
+    try:
+        genai, _ = _gemini_modules()
+        client = genai.Client(api_key=settings.gemini_key)
+        response = await asyncio.wait_for(client.aio.models.generate_content(
+            model=settings.gemini_text_model,
+            contents=prompt,
+            config={
+                "max_output_tokens": 1024,
+                "system_instruction": settings.instructions,
+            },
+        ), settings.receive_timeout)
+        answer = response.text.strip() if isinstance(response.text, str) else ""
+        if not answer:
+            raise ProviderError("empty_response")
+        log.info("Gemini text response completed")
+        return answer
+    except BaseException as error:
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        raise _provider_error(error) from None
+    finally:
+        if client is not None:
+            await _quiet_cleanup((client.aio.aclose, settings.io_timeout))
+
+
 class SpeechProvider(Protocol):
     name: str
     model: str
     input_rate: int
 
     async def connect(self): ...
+    async def start_audio(self): ...
     async def send_audio(self, pcm: bytes): ...
     def receive_audio(self) -> AsyncIterator[ProviderEvent]: ...
     async def end_audio(self): ...
@@ -124,6 +176,7 @@ class GeminiProvider:
         self.settings = settings
         self.model = settings.gemini_model
         self._client = self._context = self._session = self._types = None
+        self._received_server_message = False
 
     async def connect(self):
         if self._client is not None:
@@ -139,17 +192,21 @@ class GeminiProvider:
                     "response_modalities": ["AUDIO"],
                     "max_output_tokens": 512,
                     "system_instruction": self.settings.instructions,
-                    "speech_config": {"voice_config": {"prebuilt_voice_config": {
-                        "voice_name": self.settings.gemini_voice,
-                    }}},
+                    "speech_config": {
+                        "language_code": "en",
+                        "voice_config": {"prebuilt_voice_config": {
+                            "voice_name": self.settings.gemini_voice,
+                        }},
+                    },
                     "realtime_input_config": {
-                        "automatic_activity_detection": {"disabled": False},
+                        "automatic_activity_detection": {"disabled": True},
                     },
                 },
             )
             self._session = await asyncio.wait_for(
                 self._context.__aenter__(), self.settings.connect_timeout,
             )
+            log.info("Gemini Live WebSocket connected")
         except BaseException as error:
             await self.close()
             if isinstance(error, asyncio.CancelledError):
@@ -174,8 +231,11 @@ class GeminiProvider:
         self._connected()
         await self._send(audio=self._types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
 
+    async def start_audio(self):
+        await self._send(activity_start=self._types.ActivityStart())
+
     async def end_audio(self):
-        await self._send(audio_stream_end=True)
+        await self._send(activity_end=self._types.ActivityEnd())
 
     async def receive_audio(self):
         session = self._connected()
@@ -188,9 +248,15 @@ class GeminiProvider:
                         response = await asyncio.wait_for(
                             anext(turn), self.settings.receive_timeout,
                         )
+                    except (TimeoutError, asyncio.TimeoutError):
+                        log.warning("Gemini Live receive timeout before next server message")
+                        raise ProviderError("provider_timeout", transient=True) from None
                     except StopAsyncIteration:
                         break
                     received = True
+                    if not self._received_server_message:
+                        self._received_server_message = True
+                        log.info("Gemini Live first server message received")
                     if response.go_away:
                         raise ProviderError("session_expiring", transient=True)
                     content = response.server_content
@@ -327,6 +393,10 @@ class OpenAIProvider:
         await self._send({"type": "input_audio_buffer.append",
                           "audio": base64.b64encode(pcm).decode("ascii")})
         self._has_audio = True
+
+    async def start_audio(self):
+        # OpenAI's configured server VAD starts automatically on appended PCM.
+        return None
 
     async def end_audio(self):
         if self._has_audio:

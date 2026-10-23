@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import discord
 from discord.utils import MISSING
 
-from discord_receive import CarterVoiceClient, PCMReceiveSink, _KeepAlive
+from discord_receive import CarterVoiceClient, PCMReceiveSink, _KeepAlive, _ReceiveReader
 
 
 class ReceiveSinkTests(unittest.TestCase):
@@ -100,6 +100,20 @@ class ReceiveSinkTests(unittest.TestCase):
 
 
 class ReceiveLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reader_cleanup_uses_bounded_worker_joins(self):
+        reader = object.__new__(_ReceiveReader)
+        reader.stopped = threading.Event()
+        workers = []
+        for name in ("packet_router", "event_router", "speaking_timer", "keepalive"):
+            worker = SimpleNamespace(ident=1, join=Mock())
+            setattr(reader, name, worker)
+            workers.append(worker)
+        with patch("discord_receive.AudioReader._stop"):
+            reader._stop()
+        self.assertTrue(reader.stopped.is_set())
+        for worker in workers:
+            worker.join.assert_called_once_with(timeout=reader.WORKER_JOIN_TIMEOUT)
+
     async def test_stop_wait_and_repeated_cleanup(self):
         voice = object.__new__(CarterVoiceClient)
         voice._receive_lock = threading.RLock()
