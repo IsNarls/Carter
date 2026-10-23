@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from encounter_parser import EncounterRef
-from wow_log_gui import group_cross_report_encounters, validate_learner_selection
+from wow_log_gui import (fight_module_catalog, group_cross_report_encounters,
+                         prepare_fight_module, validate_learner_selection)
 
 
 def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
@@ -83,6 +84,63 @@ class GuiLearnerSelectionTests(unittest.TestCase):
             self.assertEqual(len(shared['pulls']), 2)
             self.assertEqual(len(shared['paths']), 2)
             self.assertEqual(sum(pull.success for pull in shared['pulls']), 1)
+
+
+class FightModuleCatalogTests(unittest.TestCase):
+    @staticmethod
+    def draft():
+        return {
+            'schema_version': 1,
+            'draft_id': 'test-boss-heroic-draft-v1',
+            'status': 'DRAFT_REQUIRES_REVIEW',
+            'pull_count': 4,
+            'script': {
+                'script_id': 'test boss:heroic',
+                'encounter_id': 3429,
+                'encounter_name': 'Test Boss',
+                'difficulty': 4,
+                'mechanics': [{
+                    'id': 'raid-hit-warning',
+                    'time': 12.5,
+                    'kind': 'ABILITY_WARNING',
+                    'message': 'Raid damage soon.',
+                }],
+            },
+        }
+
+    def test_prepares_draft_and_catalog_marks_it_ready(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            root = Path(folder)
+            drafts = root / 'mechanic-drafts'
+            modules = root / 'timer-exports'
+            drafts.mkdir()
+            draft_path = drafts / 'test-boss.json'
+            draft_path.write_text(json.dumps(self.draft()), encoding='utf-8')
+
+            before = fight_module_catalog(drafts, modules)
+            destination, payload = prepare_fight_module(draft_path, modules)
+            after = fight_module_catalog(drafts, modules)
+
+            self.assertEqual(len(before), 1)
+            self.assertFalse(before[0]['ready'])
+            self.assertEqual(destination.name, 'test-boss-heroic.timer.json')
+            self.assertTrue(payload['enabled'])
+            self.assertTrue(destination.is_file())
+            self.assertTrue(after[0]['ready'])
+            self.assertEqual(after[0]['module_path'], destination)
+
+    def test_invalid_draft_is_visible_but_cannot_be_ready(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            root = Path(folder)
+            drafts = root / 'mechanic-drafts'
+            drafts.mkdir()
+            (drafts / 'broken.json').write_text('{broken', encoding='utf-8')
+
+            items = fight_module_catalog(drafts, root / 'timer-exports')
+
+            self.assertEqual(len(items), 1)
+            self.assertFalse(items[0]['ready'])
+            self.assertTrue(items[0]['error'])
 
 
 if __name__ == '__main__':
