@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import queue
@@ -71,6 +72,42 @@ def group_cross_report_encounters(paths):
         group['paths'] = sorted(group['paths'], key=lambda path: path.name.casefold())
         result.append(group)
     return sorted(result, key=lambda item: (item['name'].casefold(), item['difficulty']))
+
+
+def selectable_report_paths(paths):
+    """Return unique existing Warcraft Logs caches, newest first."""
+    reports = []
+    seen = set()
+    for value in paths:
+        path = Path(value)
+        if not path.is_file() or not path.name.lower().endswith('.wcl.json'):
+            continue
+        try:
+            identity = path.resolve()
+        except OSError:
+            identity = path.absolute()
+        key = str(identity).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        reports.append(path)
+
+    def modified(path):
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    return sorted(reports, key=lambda path: (modified(path), path.name.casefold()), reverse=True)
+
+
+def report_modified_text(path):
+    """Format a report's local modification time for display."""
+    try:
+        return datetime.fromtimestamp(Path(path).stat().st_mtime).astimezone().strftime(
+            '%Y-%m-%d %H:%M:%S %Z')
+    except OSError:
+        return 'Unavailable'
 
 
 def _timer_module_filename(timer_id):
@@ -1505,28 +1542,62 @@ class MechanicDraftReviewWindow:
 class CrossReportLearnerWindow:
     """Choose one encounter across stored reports and learn one merged timer draft."""
 
-    def __init__(self, parent, paths):
+    def __init__(self, parent, paths=None):
         self.root = tk.Toplevel(parent)
         self.root.title('Cross-report Timer Learner')
-        self.root.geometry('980x620')
-        self.paths = list(dict.fromkeys(Path(path) for path in paths))[:5]
+        self.root.geometry('1040x780')
+        self.root.minsize(880, 650)
+        self.paths = selectable_report_paths(paths or [])[:5]
         self.groups = []
         self.messages = queue.SimpleQueue()
         self.busy = False
-        self.status = tk.StringVar(
-            value=f'{len(self.paths)} reports ready. Click Scan reports when you are ready.')
+        self.status = tk.StringVar()
 
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill='x')
         ttk.Label(header, text='Cross-report timer learner', font=('', 15, 'bold')).pack(anchor='w')
         ttk.Label(
             header, wraplength=940, justify='left',
-            text='Scan when ready to group boss pulls by encounter ID and difficulty. Then '
-                 'select a row and run the learner to interpret each source report concurrently '
-                 'and merge the evidence into one disabled timer draft.',
+            text='Choose up to five Warcraft Logs report caches. Reports are shown newest '
+                 'first. Scan when ready, then select an encounter group and run the learner.',
         ).pack(anchor='w', pady=(4, 0))
 
-        frame = ttk.Frame(self.root, padding=(12, 0))
+        reports = ttk.LabelFrame(self.root, text='Selected report caches', padding=8)
+        reports.pack(fill='x', padx=12, pady=(0, 10))
+        report_columns = ('report', 'modified', 'folder')
+        self.report_table = ttk.Treeview(
+            reports, columns=report_columns, show='headings', selectmode='extended', height=5)
+        report_settings = {
+            'report': ('Report file', 310, 'w'),
+            'modified': ('Modified (newest first)', 205, 'center'),
+            'folder': ('Folder', 430, 'w'),
+        }
+        for column, (label, width, anchor) in report_settings.items():
+            self.report_table.heading(column, text=label)
+            self.report_table.column(column, width=width, anchor=anchor)
+        report_scroll = ttk.Scrollbar(reports, orient='vertical', command=self.report_table.yview)
+        self.report_table.configure(yscrollcommand=report_scroll.set)
+        self.report_table.grid(row=0, column=0, sticky='nsew')
+        report_scroll.grid(row=0, column=1, sticky='ns')
+        reports.columnconfigure(0, weight=1)
+        self.report_table.bind('<<TreeviewSelect>>', self.report_selection_changed)
+
+        report_actions = ttk.Frame(reports)
+        report_actions.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(8, 0))
+        self.add_report_button = ttk.Button(
+            report_actions, text='Add report files...', command=self.add_report_files)
+        self.add_report_button.pack(side='left')
+        self.remove_report_button = ttk.Button(
+            report_actions, text='Remove selected', command=self.remove_selected_reports,
+            state='disabled')
+        self.remove_report_button.pack(side='left', padx=(8, 0))
+        self.clear_reports_button = ttk.Button(
+            report_actions, text='Clear', command=self.clear_reports,
+            state='normal' if self.paths else 'disabled')
+        self.clear_reports_button.pack(side='left', padx=(8, 0))
+        ttk.Label(report_actions, text='Expected file type: *.wcl.json').pack(side='right')
+
+        frame = ttk.LabelFrame(self.root, text='Matching encounter groups', padding=8)
         frame.pack(fill='both', expand=True)
         columns = ('encounter', 'difficulty', 'pulls', 'reports', 'kills', 'wipes')
         self.table = ttk.Treeview(frame, columns=columns, show='headings', selectmode='browse')
@@ -1560,10 +1631,95 @@ class CrossReportLearnerWindow:
         self.learn_button = ttk.Button(
             controls, text='Learn merged timer draft', command=self.learn, state='disabled')
         self.learn_button.pack(side='right')
+        self.refresh_report_table()
         self.root.after(100, self.poll)
 
-    def start_scan(self):
+    def refresh_report_table(self):
+        self.paths = selectable_report_paths(self.paths)
+        self.report_table.delete(*self.report_table.get_children())
+        for index, path in enumerate(self.paths):
+            self.report_table.insert('', 'end', iid=str(index), values=(
+                path.name, report_modified_text(path), str(path.parent),
+            ))
+        self.scan_button.configure(
+            state='normal' if self.paths and not self.busy else 'disabled')
+        self.clear_reports_button.configure(
+            state='normal' if self.paths and not self.busy else 'disabled')
+        self.add_report_button.configure(
+            state='normal' if len(self.paths) < 5 and not self.busy else 'disabled')
+        self.report_selection_changed()
+        if self.paths:
+            self.status.set(f'{len(self.paths)} reports selected. Click Scan reports when ready.')
+        else:
+            self.status.set('Add one or more Warcraft Logs .wcl.json report caches.')
+
+    def reports_changed(self):
+        self.groups = []
+        self.table.delete(*self.table.get_children())
+        self.learn_button.configure(state='disabled')
+        self.refresh_report_table()
+
+    def add_report_files(self):
+        if self.busy or len(self.paths) >= 5:
+            return
+        initial_directory = self.paths[0].parent if self.paths else Path(__file__).parent
+        selected = filedialog.askopenfilenames(
+            parent=self.root,
+            title='Select Warcraft Logs report caches',
+            initialdir=str(initial_directory),
+            filetypes=[('Warcraft Logs report caches', '*.wcl.json')],
+        )
+        if not selected:
+            return
+        chosen = selectable_report_paths(selected)
+        if len(chosen) != len(selected):
+            messagebox.showerror(
+                'Unsupported report file',
+                'Only existing Warcraft Logs .wcl.json report caches can be selected.',
+                parent=self.root,
+            )
+            return
+        combined = selectable_report_paths([*self.paths, *chosen])
+        if len(combined) > 5:
+            messagebox.showerror(
+                'Too many reports',
+                'Select no more than five Warcraft Logs report caches.',
+                parent=self.root,
+            )
+            return
+        self.paths = combined
+        self.reports_changed()
+
+    def report_selection_changed(self, _event=None):
+        self.remove_report_button.configure(
+            state='normal' if self.report_table.selection() and not self.busy else 'disabled')
+
+    def remove_selected_reports(self):
         if self.busy:
+            return
+        selected = {int(iid) for iid in self.report_table.selection()}
+        if not selected:
+            return
+        self.paths = [path for index, path in enumerate(self.paths) if index not in selected]
+        self.reports_changed()
+
+    def clear_reports(self):
+        if self.busy:
+            return
+        self.paths = []
+        self.reports_changed()
+
+    def set_report_controls(self, enabled):
+        self.report_table.configure(selectmode='extended' if enabled else 'none')
+        self.add_report_button.configure(
+            state='normal' if enabled and len(self.paths) < 5 else 'disabled')
+        self.clear_reports_button.configure(
+            state='normal' if enabled and self.paths else 'disabled')
+        self.remove_report_button.configure(
+            state='normal' if enabled and self.report_table.selection() else 'disabled')
+
+    def start_scan(self):
+        if self.busy or not self.paths:
             return
         self.groups = []
         self.table.delete(*self.table.get_children())
@@ -1571,6 +1727,7 @@ class CrossReportLearnerWindow:
         if selected:
             self.table.selection_remove(*selected)
         self.busy = True
+        self.set_report_controls(False)
         self.scan_button.configure(state='disabled')
         self.learn_button.configure(state='disabled')
         self.status.set(f'Reading encounter indexes from {len(self.paths)} reports...')
@@ -1598,7 +1755,8 @@ class CrossReportLearnerWindow:
         self.busy = busy
         self.status.set(message)
         self.learn_button.configure(state='disabled')
-        self.scan_button.configure(state='disabled' if busy else 'normal')
+        self.scan_button.configure(state='disabled' if busy or not self.paths else 'normal')
+        self.set_report_controls(not busy)
         if busy:
             self.progress.start(10)
         else:
@@ -1642,7 +1800,8 @@ class CrossReportLearnerWindow:
                         ))
                     self.busy = False
                     self.progress.stop()
-                    self.scan_button.configure(state='normal')
+                    self.scan_button.configure(state='normal' if self.paths else 'disabled')
+                    self.set_report_controls(True)
                     eligible = sum(1 for group in self.groups if len(group['pulls']) >= 3)
                     self.status.set(f'Found {len(self.groups)} encounter groups; '
                                     f'{eligible} have at least three pulls. Select one to learn.')
@@ -1740,12 +1899,6 @@ class Launcher:
         paths = sorted(
             Path(__file__).parent.glob('warcraft-logs-*.wcl.json'),
             key=lambda path: path.stat().st_mtime_ns, reverse=True)[:5]
-        if not paths:
-            messagebox.showinfo(
-                'No imported reports',
-                'Import at least one Warcraft Logs report before opening the cross-report learner.',
-                parent=self.root)
-            return
         CrossReportLearnerWindow(self.root, paths)
 
     def open_fight_modules(self):

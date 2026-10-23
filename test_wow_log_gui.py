@@ -1,11 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from encounter_parser import EncounterRef
 from wow_log_gui import (fight_module_catalog, group_cross_report_encounters,
-                         prepare_fight_module, validate_learner_selection)
+                         prepare_fight_module, report_modified_text,
+                         selectable_report_paths, validate_learner_selection)
 
 
 def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
@@ -22,6 +24,23 @@ def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
 
 
 class GuiLearnerSelectionTests(unittest.TestCase):
+    def test_selectable_reports_only_returns_wcl_caches_newest_first(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            root = Path(folder)
+            older = root / 'older.wcl.json'
+            newer = root / 'newer.wcl.json'
+            unsupported = root / 'combat-log.txt'
+            for path in (older, newer, unsupported):
+                path.write_text('{}', encoding='utf-8')
+            os.utime(older, (1_700_000_000, 1_700_000_000))
+            os.utime(newer, (1_700_000_100, 1_700_000_100))
+
+            reports = selectable_report_paths(
+                [older, unsupported, newer, older, root / 'missing.wcl.json'])
+
+            self.assertEqual(reports, [newer, older])
+            self.assertNotEqual(report_modified_text(newer), 'Unavailable')
+
     def test_returns_exact_selected_wcl_fight_ids(self):
         selected = [encounter(2, external_id=12), encounter(4, external_id=19),
                     encounter(7, external_id=31)]
