@@ -204,9 +204,10 @@ python analysis_api.py `
 ```
 
 The API also uses `timer-exports` under its storage directory automatically when
-that directory exists. Only exports with `enabled: true` are loaded. The timer
-review window creates these explicitly with **Export enabled live module...**;
-ordinary schema exports remain disabled.
+that directory exists. Only exports with `enabled: true` are loaded. Open
+**Fight modules** from the main window and choose **Prepare selected for live
+use** to create one explicitly. The timer draft review remains an analysis and
+schema-export screen, and ordinary schema exports remain disabled.
 
 Modules are indexed in memory by encounter ID and difficulty. `ENCOUNTER_START`
 therefore performs no report analysis or disk loading: it verifies the live
@@ -337,9 +338,9 @@ GET /api/v1/mechanic-drafts/{draft_id}/timer-export
 ```
 
 The timer-export endpoint returns the smaller `wow-fight-timer/v1` runtime
-contract rather than the full learner evidence. The same contract can be written
-from the timer review window with **Export timer schema...**, or from the command
-line:
+contract rather than the full learner evidence. The same disabled contract can
+be written from the timer review window with **Export timer schema...**, or from
+the command line:
 
 ```powershell
 python mechanic_timer_learner.py report.wcl.json `

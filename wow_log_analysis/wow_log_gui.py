@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import queue
 import statistics
@@ -15,7 +16,7 @@ from combat_log_viewer import Viewer
 from encounter_parser import (analyze_encounter, scan_encounters, write_boss_position_csv,
                               write_csv, write_player_csv, Position, WOW_CLASS_COLORS)
 from mechanic_timer_learner import learn_timer_script, save_draft
-from timer_export import build_timer_export, save_timer_export
+from timer_export import TIMER_EXPORT_FORMAT, build_timer_export, save_timer_export
 from warcraft_logs_importer import (WarcraftLogsClient, download_report_batch,
                                     load_cache, load_credentials, prepare_report_batch)
 
@@ -70,6 +71,78 @@ def group_cross_report_encounters(paths):
         group['paths'] = sorted(group['paths'], key=lambda path: path.name.casefold())
         result.append(group)
     return sorted(result, key=lambda item: (item['name'].casefold(), item['difficulty']))
+
+
+def _timer_module_filename(timer_id):
+    """Return a path-safe, predictable filename for one managed timer module."""
+    safe = ''.join(character if character.isalnum() or character in '-_.' else '-'
+                   for character in str(timer_id)).strip('-.')
+    return f'{(safe or "timer-module")[:150]}.timer.json'
+
+
+def fight_module_catalog(draft_directory, module_directory):
+    """Describe saved learner drafts and whether each has an enabled live export."""
+    draft_directory = Path(draft_directory)
+    module_directory = Path(module_directory)
+    enabled_modules = {}
+    if module_directory.is_dir():
+        for path in module_directory.glob('*.json'):
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if (payload.get('format') == TIMER_EXPORT_FORMAT and payload.get('enabled') and
+                    payload.get('timer_id')):
+                enabled_modules[str(payload['timer_id'])] = path
+
+    items = []
+    if not draft_directory.is_dir():
+        return items
+    for path in draft_directory.glob('*.json'):
+        try:
+            draft = json.loads(path.read_text(encoding='utf-8'))
+            preview = build_timer_export(draft, enabled=False)
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            items.append({
+                'draft_path': path,
+                'draft_id': path.stem,
+                'encounter_name': path.stem,
+                'difficulty': '-',
+                'callout_count': 0,
+                'pull_count': 0,
+                'ready': False,
+                'module_path': None,
+                'error': str(error),
+            })
+            continue
+        timer_id = str(preview['timer_id'])
+        module_path = enabled_modules.get(timer_id)
+        items.append({
+            'draft_path': path,
+            'draft_id': timer_id,
+            'encounter_name': preview['encounter']['name'],
+            'difficulty': preview['encounter']['difficulty'],
+            'callout_count': len(preview['callouts']),
+            'pull_count': preview['provenance']['pull_count'],
+            'ready': module_path is not None,
+            'module_path': module_path,
+            'error': None,
+        })
+    return sorted(items, key=lambda item: (
+        str(item['encounter_name']).casefold(), str(item['difficulty']), item['draft_id']))
+
+
+def prepare_fight_module(draft_path, module_directory):
+    """Promote one reviewed learner draft into the managed live-module directory."""
+    draft_path = Path(draft_path)
+    try:
+        draft = json.loads(draft_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f'Could not read timer draft {draft_path.name}: {error}') from error
+    payload = build_timer_export(draft, enabled=True)
+    destination = Path(module_directory) / _timer_module_filename(payload['timer_id'])
+    save_timer_export(payload, destination)
+    return destination, payload
 
 
 class TimelineWindow:
@@ -1096,6 +1169,124 @@ class MechanicComparisonWindow:
             self.refresh()
 
 
+class FightModuleWindow:
+    """Prepare reviewed fight timers for live encounter matching."""
+
+    def __init__(self, parent):
+        self.root = tk.Toplevel(parent)
+        self.root.title('Fight Modules')
+        self.root.geometry('900x520')
+        self.root.minsize(760, 420)
+        self.draft_directory = Path(__file__).parent / 'mechanic-drafts'
+        self.module_directory = Path(__file__).parent / 'timer-exports'
+        self.items = []
+        self.status = tk.StringVar()
+
+        header = ttk.Frame(self.root, padding=14)
+        header.pack(fill='x')
+        ttk.Label(header, text='Fight modules', font=('', 15, 'bold')).pack(anchor='w')
+        ttk.Label(
+            header,
+            text=('Prepare reviewed timer drafts for live use. Preparing a module does not '
+                  'start its clock; the matching ENCOUNTER_START event starts the fight timer.'),
+            wraplength=850,
+            justify='left',
+        ).pack(anchor='w', pady=(4, 0))
+
+        frame = ttk.Frame(self.root, padding=(14, 0))
+        frame.pack(fill='both', expand=True)
+        columns = ('encounter', 'difficulty', 'callouts', 'pulls', 'status')
+        self.table = ttk.Treeview(frame, columns=columns, show='headings', selectmode='browse')
+        settings = {
+            'encounter': ('Encounter', 340, 'w'),
+            'difficulty': ('Difficulty', 100, 'center'),
+            'callouts': ('Callouts', 85, 'center'),
+            'pulls': ('Source pulls', 100, 'center'),
+            'status': ('Live status', 150, 'center'),
+        }
+        for column, (label, width, anchor) in settings.items():
+            self.table.heading(column, text=label)
+            self.table.column(column, width=width, anchor=anchor)
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.table.yview)
+        self.table.configure(yscrollcommand=scroll.set)
+        self.table.grid(row=0, column=0, sticky='nsew')
+        scroll.grid(row=0, column=1, sticky='ns')
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.table.bind('<<TreeviewSelect>>', self.selection_changed)
+
+        controls = ttk.Frame(self.root, padding=14)
+        controls.pack(fill='x')
+        ttk.Label(controls, textvariable=self.status).pack(side='left', fill='x', expand=True)
+        ttk.Button(controls, text='Refresh', command=self.refresh).pack(side='right')
+        self.prepare_button = ttk.Button(
+            controls, text='Prepare selected for live use', command=self.prepare_selected,
+            state='disabled')
+        self.prepare_button.pack(side='right', padx=(0, 8))
+        self.refresh()
+
+    def refresh(self, selected_draft_id=None):
+        self.items = fight_module_catalog(self.draft_directory, self.module_directory)
+        self.table.delete(*self.table.get_children())
+        selected_iid = None
+        for index, item in enumerate(self.items):
+            iid = str(index)
+            if item['error']:
+                state = 'Invalid draft'
+            elif item['ready']:
+                state = 'Ready'
+            else:
+                state = 'Draft only'
+            difficulty = item['difficulty'] if item['difficulty'] is not None else 'Any'
+            self.table.insert('', 'end', iid=iid, values=(
+                item['encounter_name'], difficulty, item['callout_count'],
+                item['pull_count'], state,
+            ))
+            if item['draft_id'] == selected_draft_id:
+                selected_iid = iid
+        ready = sum(1 for item in self.items if item['ready'])
+        invalid = sum(1 for item in self.items if item['error'])
+        if not self.items:
+            self.status.set('No learned drafts found. Run the timer learner first.')
+        else:
+            suffix = f'  |  {invalid} invalid' if invalid else ''
+            self.status.set(f'{len(self.items)} fight drafts  |  {ready} ready for live use{suffix}')
+        if selected_iid is not None:
+            self.table.selection_set(selected_iid)
+            self.table.focus(selected_iid)
+        self.selection_changed()
+
+    def selected_item(self):
+        selected = self.table.selection()
+        return self.items[int(selected[0])] if selected else None
+
+    def selection_changed(self, _event=None):
+        item = self.selected_item()
+        self.prepare_button.configure(
+            state='normal' if item is not None and not item['error'] else 'disabled')
+        if item is not None and item['error']:
+            self.status.set(f"Invalid draft: {item['error']}")
+
+    def prepare_selected(self):
+        item = self.selected_item()
+        if item is None or item['error']:
+            return
+        try:
+            destination, payload = prepare_fight_module(
+                item['draft_path'], self.module_directory)
+        except (OSError, TypeError, ValueError) as error:
+            messagebox.showerror('Could not prepare fight module', str(error), parent=self.root)
+            return
+        self.refresh(selected_draft_id=item['draft_id'])
+        messagebox.showinfo(
+            'Fight module ready',
+            f"{payload['encounter']['name']} is ready for live encounter matching.\n\n"
+            f'Saved to:\n{destination}\n\n'
+            'Its timer will start only when the matching encounter begins.',
+            parent=self.root,
+        )
+
+
 class MechanicDraftReviewWindow:
     """Show a learned draft and its evidence without enabling the timer script."""
 
@@ -1108,11 +1299,8 @@ class MechanicDraftReviewWindow:
 
         header = ttk.Frame(self.root, padding=10)
         header.pack(fill='x')
-        ttk.Button(header, text='Export enabled live module...',
-                   command=lambda: self.export_timer(enabled=True)).pack(side='right')
         ttk.Button(header, text='Export timer schema...',
-                   command=lambda: self.export_timer(enabled=False)).pack(
-            side='right', padx=(0, 8))
+                   command=self.export_timer).pack(side='right')
         ttk.Label(header, text=f"{result['encounter_name']} timer draft",
                   font=('', 14, 'bold')).pack(anchor='w')
         ttk.Label(
@@ -1287,32 +1475,30 @@ class MechanicDraftReviewWindow:
                 f"{overlap['median_separation_seconds']:.1f}s",
             ))
 
-    def export_timer(self, enabled=False):
+    def export_timer(self):
         export_directory = Path(__file__).parent / 'timer-exports'
         export_directory.mkdir(parents=True, exist_ok=True)
         destination = filedialog.asksaveasfilename(
             parent=self.root,
             title='Export portable timer schema',
             initialdir=str(export_directory),
-            initialfile=(f"{self.result['draft_id']}.timer.json" if enabled else
-                         f"{self.result['draft_id']}.draft.timer.json"),
+            initialfile=f"{self.result['draft_id']}.draft.timer.json",
             defaultextension='.timer.json',
             filetypes=[('Timer schema', '*.timer.json'), ('JSON files', '*.json')],
         )
         if not destination:
             return
         try:
-            payload = build_timer_export(self.result, enabled=enabled)
+            payload = build_timer_export(self.result, enabled=False)
             save_timer_export(payload, destination)
         except (OSError, TypeError, ValueError) as error:
             messagebox.showerror('Timer export failed', str(error), parent=self.root)
             return
         messagebox.showinfo(
-            'Live timer module exported' if enabled else 'Timer schema exported',
+            'Timer schema exported',
             f'Saved portable timer schema:\n{destination}\n\n'
-            + ('The module is enabled for live loading. Arm it before the pull or let the '
-               'encounter trigger select it automatically.' if enabled else
-               'The export remains disabled until it is reviewed and enabled by its consumer.'),
+            'The export remains disabled. Use Fight Modules from the main window to prepare '
+            'a reviewed draft for live use.',
             parent=self.root)
 
 
@@ -1480,8 +1666,8 @@ class Launcher:
     def __init__(self, root, initial=None):
         self.root = root
         root.title('WoW Combat Log Tools')
-        root.geometry('1020x400')
-        root.minsize(900, 370)
+        root.geometry('1020x470')
+        root.minsize(900, 430)
         chosen = initial or default_log()
         self.path = tk.StringVar(value=str(chosen or ''))
 
@@ -1497,15 +1683,22 @@ class Launcher:
 
         actions = ttk.Frame(body, padding=(0, 24, 0, 0))
         actions.pack(fill='both', expand=True)
+        for column in range(3):
+            actions.columnconfigure(column, weight=1, uniform='launcher-actions')
+        actions.rowconfigure(0, weight=1)
+        actions.rowconfigure(1, weight=1)
         viewer = ttk.Button(actions, text='Open live / replay viewer', command=self.open_viewer)
-        viewer.pack(side='left', fill='both', expand=True, padx=(0, 8))
+        viewer.grid(row=0, column=0, sticky='nsew', padx=(0, 6), pady=(0, 6))
         timeline = ttk.Button(actions, text='Timeline / player analysis', command=self.open_timeline)
-        timeline.pack(side='left', fill='both', expand=True, padx=(8, 0))
+        timeline.grid(row=0, column=1, sticky='nsew', padx=6, pady=(0, 6))
         importer = ttk.Button(actions, text='Import Warcraft Logs URL', command=self.open_importer)
-        importer.pack(side='left', fill='both', expand=True, padx=(8, 0))
+        importer.grid(row=0, column=2, sticky='nsew', padx=(6, 0), pady=(0, 6))
         cross_report = ttk.Button(actions, text='Cross-report timer learner',
                                   command=self.open_cross_report_learner)
-        cross_report.pack(side='left', fill='both', expand=True, padx=(8, 0))
+        cross_report.grid(row=1, column=0, sticky='nsew', padx=(0, 6), pady=(6, 0))
+        fight_modules = ttk.Button(actions, text='Fight modules',
+                                   command=self.open_fight_modules)
+        fight_modules.grid(row=1, column=1, sticky='nsew', padx=6, pady=(6, 0))
         ttk.Label(body, text='View damage, healing, DPS/HPS, rank, and position, or export timeline CSV files.')\
             .pack(anchor='w', pady=(14, 0))
 
@@ -1554,6 +1747,9 @@ class Launcher:
                 parent=self.root)
             return
         CrossReportLearnerWindow(self.root, paths)
+
+    def open_fight_modules(self):
+        FightModuleWindow(self.root)
 
     def import_finished(self, paths):
         paths = [Path(path) for path in paths]
