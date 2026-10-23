@@ -265,6 +265,9 @@ Logs pulls. It reads the downloaded cache only when explicitly run; normal API
 requests continue to use compact metadata and sidecars.
 
 For several reports, choose **Cross-report timer learner** in the main GUI. The
+window lists the selected report caches with their local modification timestamps,
+newest first. Use **Add report files...** to select up to five existing
+`*.wcl.json` files; the picker only displays that supported cache type. The
 window remains idle until **Scan reports** is selected. After scanning, choose an
 encounter group and explicitly run **Learn merged timer draft**. Each selected
 report is then interpreted in its own worker process, up to five workers, and
