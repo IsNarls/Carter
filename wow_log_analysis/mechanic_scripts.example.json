@@ -1,0 +1,33 @@
+{
+  "scripts": [
+    {
+      "script_id": "generic-placeholder-v1",
+      "encounter_id": null,
+      "encounter_name": "Generic placeholder timeline",
+      "difficulty": "any",
+      "placeholder": true,
+      "encounter_triggers": {
+        "start": {
+          "id": "fight-begin",
+          "event_type": "ENCOUNTER_START",
+          "action": "START_TIMELINE",
+          "establishes_time_zero": true
+        },
+        "end": {
+          "id": "fight-end",
+          "event_type": "ENCOUNTER_END",
+          "action": "END_TIMELINE",
+          "cancel_pending_mechanics": true
+        }
+      },
+      "mechanics": [
+        {"id": "start", "time": 0, "message": "Boss encounter started."},
+        {"id": "mechanic_1_warning", "time": 10, "message": "Mechanic one approaching."},
+        {"id": "mechanic_1", "time": 20, "message": "Mechanic one activated."},
+        {"id": "mechanic_2_warning", "time": 35, "message": "Mechanic two approaching."},
+        {"id": "mechanic_2", "time": 45, "message": "Mechanic two activated."},
+        {"id": "phase_change", "time": 60, "message": "Encounter phase transition."}
+      ]
+    }
+  ]
+}
