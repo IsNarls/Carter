@@ -1,0 +1,15 @@
+.env
+*.wcl.json
+*.analysis/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Raw combat logs and generated analysis data
+Archive-WoWCombatLog-*.txt
+simulated-WoWCombatLog.txt
+*.csv
+*.meta.json
+mechanic-drafts/
+timer-exports/
+live-analysis/
