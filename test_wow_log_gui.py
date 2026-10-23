@@ -6,9 +6,9 @@ from pathlib import Path
 
 from encounter_parser import EncounterRef
 from wow_log_gui import (fight_module_catalog, filter_checked_report_paths,
-                         group_cross_report_encounters, prepare_fight_module,
-                         report_modified_text, report_path_key, selectable_report_paths,
-                         validate_learner_selection)
+                         group_cross_report_encounters, newest_report_keys,
+                         prepare_fight_module, report_modified_text, report_path_key,
+                         selectable_report_paths, validate_learner_selection)
 
 
 def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
@@ -40,9 +40,11 @@ class GuiLearnerSelectionTests(unittest.TestCase):
                 [older, unsupported, newer, older, root / 'missing.wcl.json'])
             checked = filter_checked_report_paths(
                 reports, {report_path_key(older)})
+            newest = newest_report_keys(reports, limit=1)
 
             self.assertEqual(reports, [newer, older])
             self.assertEqual(checked, [older])
+            self.assertEqual(newest, {report_path_key(newer)})
             self.assertNotEqual(report_modified_text(newer), 'Unavailable')
 
     def test_returns_exact_selected_wcl_fight_ids(self):
