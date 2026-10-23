@@ -145,6 +145,7 @@ Selections are isolated by guild and survive Carter restarts. Carter still remai
 - `/logs death` explains one selected player's death and attaches its matching position diagram when available.
 - `/logs deaths` lists the selected pull's deaths in fight-relative timestamp order.
 - `/logs identity` maps the invoking Discord user to a character name for “Why did I die?” requests.
+- `/logs ingest <channel>` saves the selected logs channel, scans recent history newest-first, and queues no more than five unique reports for local download and storage.
 - `/logs import` starts a report import or refresh job.
 - `/logs job` reports the status and outcome of an import job.
 
@@ -152,7 +153,9 @@ Discord option descriptions are the source of truth for each command's required 
 
 ## Report ingestion and import jobs
 
-When `CARTER_ANALYSIS_LOG_CHANNEL_INGEST=true`, Carter scans messages from the guild's selected logs channel for `warcraftlogs.com/reports/...` URLs, including supported embed and forwarded-message content. It submits discovered report codes to the local service rather than downloading Warcraft Logs data itself.
+When `CARTER_ANALYSIS_LOG_CHANNEL_INGEST=true`, Carter scans new messages from the guild's selected logs channel for `warcraftlogs.com/reports/...` URLs, including supported embed and forwarded-message content. Use `/logs ingest <channel>` for an explicit historical scan even when passive monitoring is disabled. Each invocation checks at most 100 recent messages and stops after five unique reports. Carter serializes all of its report imports, processes a historical batch oldest-to-newest, and rejects a second historical batch until the first finishes. The selected channel is persisted per guild, and later report-link messages continue to be ingested automatically when passive monitoring is enabled.
+
+Carter submits discovered report codes to its local analysis service. That service downloads the Warcraft Logs data and persists the prepared report under `log_backend/data`; the Discord process does not maintain a second downloader or cache. Import completion or failure is posted safely in the selected channel.
 
 Imports are jobs because a complete report can require several API requests. `/logs import` acknowledges the request, and `/logs job` exposes progress or a safe error. Importing the same report again refreshes its stored fights so a live raid log can gain new pulls without creating a separate logical report. Backend storage under `log_backend/data` persists across Carter restarts; do not commit or expose that runtime directory.
 
@@ -197,6 +200,7 @@ Live Discord, provider, and Warcraft Logs checks were **not performed as part of
 - The backend starts on `127.0.0.1:8765`, `/logs health` succeeds, and it is not reachable from another host.
 - Carter starts once, registers commands, and does not autojoin voice.
 - `/carter setvoice` and `/carter setlogs` save different guilds' selections independently; a Carter restart restores the selections but remains disconnected.
+- `/logs ingest` saves the specified channel, finds no more than five unique reports in the newest 100 messages, and leaves downloaded data in `log_backend/data` after restart.
 - `/logs import` accepts a known report, `/logs job` reaches a successful or explicitly partial terminal state, and re-importing a live report adds new fights.
 - `/logs reports`, `/logs fights`, `/logs source`, and `/logs summary` resolve the intended source and selected fight.
 - `/logs ranking` reports top DPS for the selected encounter rather than sorting by raw damage; HPS uses the selected encounter duration.

@@ -74,6 +74,28 @@ class ConfigurationTests(unittest.TestCase):
             ["https://www.warcraftlogs.com/reports/AbCdEf1234567890#fight=4"],
         )
 
+    def test_real_discord_snapshot_shape_exposes_embed_report_url(self):
+        snapshot = SimpleNamespace(
+            content="",
+            embeds=[SimpleNamespace(to_dict=lambda: {
+                "fields": [{
+                    "name": "Reports",
+                    "value": (
+                        "[Warcraft Logs](https://www.warcraftlogs.com/reports/ZXcvBNm12345)"
+                    ),
+                }],
+            })],
+            attachments=[], stickers=[], components=[],
+        )
+        message = SimpleNamespace(
+            content="", embeds=[], attachments=[], stickers=[], components=[],
+            message_snapshots=[snapshot],
+        )
+        self.assertEqual(
+            _message_report_urls(message),
+            ["https://www.warcraftlogs.com/reports/ZXcvBNm12345"],
+        )
+
     def test_import_job_format_uses_backend_progress_contract(self):
         text = _format_job({
             "job_id": "a" * 32,
@@ -142,7 +164,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {command.name for command in logs.commands},
             {"health", "reports", "fights", "select", "source", "summary", "ranking",
-             "player", "death", "deaths", "identity", "import", "job"},
+             "player", "death", "deaths", "identity", "ingest", "import", "job"},
         )
 
     async def test_generic_ask_uses_text_model_without_voice(self):
@@ -185,6 +207,131 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*tasks)
         self.assertIn("job `job-1`", self.interaction.followup.send.await_args_list[0].args[0])
         self.assertEqual(self.state.analysis_state.report_id, "ReportABC123")
+        self.assertFalse(self.bot.import_lock.locked())
+        self.assertNotIn("ReportABC123", self.state.importing)
+
+    async def test_direct_import_does_not_overlap_an_active_import(self):
+        self.bot.raid.submit_report = AsyncMock()
+        await self.bot.import_lock.acquire()
+        try:
+            await self.bot.logs_import(
+                self.interaction, "https://www.warcraftlogs.com/reports/ReportABC123",
+            )
+        finally:
+            self.bot.import_lock.release()
+        self.bot.raid.submit_report.assert_not_awaited()
+        self.assertIn(
+            "Another report is being prepared",
+            self.interaction.followup.send.await_args.args[0],
+        )
+
+    async def test_logs_ingest_saves_channel_and_queues_only_five_recent_reports(self):
+        self.bot.analysis_settings = AnalysisClientSettings(True)
+        self.bot.monitor_log_channel = False
+        log_channel = MagicMock()
+        log_channel.id = 40
+        log_channel.permissions_for.return_value = SimpleNamespace(
+            view_channel=True, read_message_history=True,
+            send_messages=True, attach_files=True,
+        )
+        report_ids = [f"ReportCode{index:02d}" for index in range(1, 7)]
+        messages = [
+            SimpleNamespace(
+                content=(
+                    f"https://www.warcraftlogs.com/reports/{report_id} "
+                    f"https://www.warcraftlogs.com/reports/{report_id}#fight=2"
+                ),
+                embeds=[], attachments=[], stickers=[], components=[], message_snapshots=[],
+            )
+            for report_id in report_ids
+        ]
+        history_calls = []
+
+        async def history(*, limit, oldest_first):
+            history_calls.append((limit, oldest_first))
+            for message in messages[:limit]:
+                yield message
+
+        log_channel.history = history
+        with patch.object(self.bot, "_run_import", AsyncMock()) as run_import:
+            await self.bot.logs_ingest(self.interaction, log_channel)
+            tasks = list(self.state.import_tasks)
+            if tasks:
+                await asyncio.gather(*tasks)
+
+        self.assertEqual(history_calls, [(100, False)])
+        self.assertEqual(run_import.await_count, 5)
+        queued_ids = [
+            call.args[2]
+            for call in run_import.await_args_list
+        ]
+        self.assertEqual(queued_ids, list(reversed(report_ids[:5])))
+        self.assertEqual(self.state.logs_channel_id, 40)
+        payload = json.loads((Path(self.directory.name) / "guild-settings.json").read_text())
+        self.assertEqual(payload["guilds"]["10"]["logs_channel_id"], 40)
+        response = self.interaction.followup.send.await_args.args[0]
+        self.assertIn("found 5 unique report(s)", response)
+        self.assertIn("limited to five reports", response)
+
+    async def test_historical_import_batch_continues_and_finishes_with_newest(self):
+        reports = [
+            ("NewestReport01", "https://www.warcraftlogs.com/reports/NewestReport01"),
+            ("OlderReport002", "https://www.warcraftlogs.com/reports/OlderReport002"),
+        ]
+        calls = []
+
+        async def run_import(_state, _url, report_id, _channel):
+            calls.append(report_id)
+            if report_id == "OlderReport002":
+                raise RuntimeError("private detail")
+
+        with (
+            patch.object(self.bot, "_run_import", side_effect=run_import),
+            patch.object(self.bot, "_report_import_failure", AsyncMock()) as report_failure,
+        ):
+            await self.bot._run_import_batch(self.state, reports, self.channel)
+
+        self.assertEqual(calls, ["OlderReport002", "NewestReport01"])
+        report_failure.assert_awaited_once()
+        self.assertEqual(report_failure.await_args.args[1], "OlderReport002")
+
+    async def test_cancelled_historical_batch_releases_all_reservations(self):
+        reports = [
+            ("ReportCode01", "https://www.warcraftlogs.com/reports/ReportCode01"),
+            ("ReportCode02", "https://www.warcraftlogs.com/reports/ReportCode02"),
+        ]
+        with patch.object(self.bot, "_run_import", AsyncMock()):
+            queued, skipped, busy = self.bot._schedule_import_batch(
+                self.state, reports, self.channel,
+            )
+            second = self.bot._schedule_import_batch(
+                self.state,
+                [("ReportCode03", "https://www.warcraftlogs.com/reports/ReportCode03")],
+                self.channel,
+            )
+            task = self.state.history_import_task
+            self.assertEqual((queued, skipped, busy), (2, 0, False))
+            self.assertEqual(second, (0, 0, True))
+            self.assertIsNotNone(task)
+            self.assertEqual(set(self.state.importing), {"ReportCode01", "ReportCode02"})
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        self.assertIsNone(self.state.history_import_task)
+        self.assertFalse(self.state.import_tasks)
+        self.assertFalse(self.state.importing)
+
+    async def test_logs_ingest_does_not_change_channel_when_analysis_is_disabled(self):
+        self.state.logs_channel_id = 41
+        log_channel = MagicMock()
+        log_channel.id = 42
+        await self.bot.logs_ingest(self.interaction, log_channel)
+        self.assertEqual(self.state.logs_channel_id, 41)
+        self.assertIn(
+            "analysis is disabled",
+            self.interaction.followup.send.await_args.args[0],
+        )
 
     async def test_authorization_denies_wrong_user_but_supports_other_guild(self):
         self.interaction.user.id = 999

@@ -29,6 +29,8 @@ from wake_listener import WakeListener, WakeSettings
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / ".carter_data"
+INGEST_MESSAGE_SCAN_LIMIT = 100
+INGEST_REPORT_LIMIT = 5
 log = logging.getLogger("carter")
 
 
@@ -128,6 +130,7 @@ class GuildRuntime:
         self.want_voice = False
         self.import_tasks: set[asyncio.Task] = set()
         self.importing: dict[str, asyncio.Task] = {}
+        self.history_import_task: asyncio.Task | None = None
 
 
 class Carter(discord.Client):
@@ -139,7 +142,9 @@ class Carter(discord.Client):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.voice_states = True
-        intents.message_content = bool(analysis_settings.enabled and monitor_log_channel)
+        # Explicit historical ingestion still needs message/embed visibility when
+        # passive on-message monitoring is disabled.
+        intents.message_content = bool(analysis_settings.enabled)
         super().__init__(intents=intents)
         self.legacy_guild_id = int(legacy_guild_id or 0)
         self.allowed_users = set(allowed_users)
@@ -152,6 +157,9 @@ class Carter(discord.Client):
         self.raid = RaidAnalysis(self.analysis_client)
         self.settings_store = GuildSettingsStore(DATA_ROOT / "guild-settings.json")
         self.guilds_runtime: dict[int, GuildRuntime] = {}
+        # The backend intentionally has one import worker. Serializing Carter's
+        # submissions avoids filling its bounded queue from multiple guilds or commands.
+        self.import_lock = asyncio.Lock()
 
         self.tree = app_commands.CommandTree(self)
         carter = app_commands.Group(name="carter", description="Control Carter")
@@ -199,6 +207,9 @@ class Carter(discord.Client):
         )
         logs.command(name="identity", description="Map your Discord account to a character")(
             self.logs_identity,
+        )
+        logs.command(name="ingest", description="Import reports from a selected channel")(
+            self.logs_ingest,
         )
         logs.command(name="import", description="Queue a Warcraft Logs report in the backend")(
             self.logs_import,
@@ -428,19 +439,27 @@ class Carter(discord.Client):
         state = self.runtime(interaction.guild_id)
         state.logs_channel_id = channel.id
         self.save_runtime(state)
-        queued = 0
+        scanned = found = queued = skipped = 0
+        batch_busy = False
         if self.analysis_settings.enabled and self.monitor_log_channel:
             try:
-                async for message in channel.history(limit=5):
-                    for url in _message_report_urls(message):
-                        if self._schedule_import(state, url, channel):
-                            queued += 1
-            except discord.HTTPException:
+                scanned, found, queued, skipped, batch_busy = await self._ingest_channel_history(
+                    state, channel,
+                )
+            except (discord.HTTPException, asyncio.TimeoutError):
                 log.warning("Initial logs-channel history scan failed: guild=%s", state.guild_id)
-        await interaction.followup.send(
-            f"Log-link channel saved. Queued {queued} unique report(s) from the latest five messages.",
-            ephemeral=True,
-        )
+        if batch_busy:
+            message = (
+                "Log-link channel saved, but another historical ingest batch is still running. "
+                "Run `/logs ingest` after it completes."
+            )
+        else:
+            message = (
+                f"Log-link channel saved. Scanned {scanned} recent message(s), found {found} "
+                f"unique report(s), queued {queued} for local storage, and skipped {skipped} "
+                "already-running report(s)."
+            )
+        await interaction.followup.send(message, ephemeral=True)
 
     async def set_channels(self, interaction: discord.Interaction,
                            voice_channel: discord.VoiceChannel,
@@ -700,6 +719,70 @@ class Carter(discord.Client):
             "Your character mapping was saved for this server.", ephemeral=True,
         )
 
+    async def logs_ingest(self, interaction: discord.Interaction,
+                          channel: discord.TextChannel):
+        """Save a log channel and queue up to five reports from its newest messages."""
+        if not await self.authorize(interaction):
+            return
+        if not self.analysis_settings.enabled:
+            await interaction.followup.send(
+                "Raid-log analysis is disabled in Carter's configuration.", ephemeral=True,
+            )
+            return
+        permissions = channel.permissions_for(interaction.guild.me)
+        if not (permissions.view_channel and permissions.read_message_history
+                and permissions.send_messages and permissions.attach_files):
+            await interaction.followup.send(
+                "Carter needs View Channel, Read Message History, Send Messages, and Attach Files "
+                "in that channel.", ephemeral=True,
+            )
+            return
+
+        state = self.runtime(interaction.guild_id)
+        state.logs_channel_id = channel.id
+        self.save_runtime(state)
+        try:
+            scanned, found, queued, skipped, batch_busy = await self._ingest_channel_history(
+                state, channel,
+            )
+        except (discord.HTTPException, asyncio.TimeoutError):
+            log.warning(
+                "Requested logs-channel history scan failed: guild=%s channel=%s",
+                state.guild_id, channel.id,
+            )
+            await interaction.followup.send(
+                "The log channel was saved, but Carter could not read its recent history.",
+                ephemeral=True,
+            )
+            return
+
+        if batch_busy:
+            await interaction.followup.send(
+                "Log channel saved, but another historical ingest batch is still running. "
+                "Run this command again after that batch completes.",
+                ephemeral=True,
+            )
+            return
+        log.info(
+            "Discord log history ingest queued: guild=%s channel=%s messages=%s reports=%s "
+            "queued=%s skipped=%s",
+            state.guild_id, channel.id, scanned, found, queued, skipped,
+        )
+        if not found:
+            await interaction.followup.send(
+                f"Log channel saved, but no Warcraft Logs report URL was visible in the "
+                f"{scanned} recent message(s) checked. Confirm Discord's Message Content Intent "
+                "is enabled and that Carter can read the channel.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"Log channel saved. Scanned {scanned} recent message(s), found {found} unique "
+            f"report(s), queued {queued} for local backend download and storage, and skipped "
+            f"{skipped} already-running report(s). Each run is limited to five reports.",
+            ephemeral=True,
+        )
+
     async def logs_import(self, interaction: discord.Interaction,
                           report_url: app_commands.Range[str, 1, 500]):
         if not await self.authorize(interaction):
@@ -714,17 +797,49 @@ class Carter(discord.Client):
         if existing and not existing.done():
             await interaction.followup.send("That report is already being prepared.", ephemeral=True)
             return
+        if self.import_lock.locked():
+            await interaction.followup.send(
+                "Another report is being prepared. Try this import again after it completes.",
+                ephemeral=True,
+            )
+            return
+        await self.import_lock.acquire()
         try:
             queued = await self.raid.submit_report(match.group(0))
         except AnalysisClientError as error:
+            self.import_lock.release()
             await interaction.followup.send(user_error(error), ephemeral=True)
             return
-        job_id = str(queued.tool_context["job_id"])
-        task = asyncio.create_task(
-            self._poll_import(state, job_id, report_id, interaction.channel),
-            name=f"carter-import-{state.guild_id}-{report_id}",
-        )
+        except BaseException:
+            self.import_lock.release()
+            raise
+        try:
+            job_id = str(queued.tool_context["job_id"])
+        except (AttributeError, KeyError, TypeError):
+            self.import_lock.release()
+            await interaction.followup.send(
+                "The analysis backend returned an invalid import response.", ephemeral=True,
+            )
+            return
+        lock_guard = {"held": True}
+        try:
+            task = asyncio.create_task(
+                self._poll_import_locked(
+                    state, job_id, report_id, interaction.channel, lock_guard,
+                ),
+                name=f"carter-import-{state.guild_id}-{report_id}",
+            )
+        except BaseException:
+            self.import_lock.release()
+            raise
         self._remember_import_task(state, report_id, task)
+
+        def release_unstarted_lock(_done_task):
+            if lock_guard["held"]:
+                lock_guard["held"] = False
+                self.import_lock.release()
+
+        task.add_done_callback(release_unstarted_lock)
         await interaction.followup.send(queued.text, ephemeral=True)
 
     async def logs_job(self, interaction: discord.Interaction,
@@ -793,21 +908,133 @@ class Carter(discord.Client):
         self._remember_import_task(state, report_id, task)
         return True
 
+    async def _ingest_channel_history(self, state, channel):
+        """Find five recent unique reports and queue one sequential import batch."""
+        existing_batch = state.history_import_task
+        if existing_batch and not existing_batch.done():
+            return 0, 0, 0, 0, True
+        scanned = 0
+        report_ids = set()
+        reports = []
+        async for message in channel.history(
+                limit=INGEST_MESSAGE_SCAN_LIMIT, oldest_first=False):
+            if scanned >= INGEST_MESSAGE_SCAN_LIMIT or len(report_ids) >= INGEST_REPORT_LIMIT:
+                break
+            scanned += 1
+            for url in _message_report_urls(message):
+                match = REPORT_URL.search(url)
+                if not match:
+                    continue
+                report_id = match.group(1)
+                if report_id in report_ids:
+                    continue
+                report_ids.add(report_id)
+                reports.append((report_id, match.group(0)))
+                if len(report_ids) >= INGEST_REPORT_LIMIT:
+                    break
+        queued, skipped, batch_busy = self._schedule_import_batch(state, reports, channel)
+        return scanned, len(report_ids), queued, skipped, batch_busy
+
+    def _schedule_import_batch(self, state, reports, channel):
+        """Reserve report IDs immediately and process the batch without backend queue overflow."""
+        existing_batch = state.history_import_task
+        if existing_batch and not existing_batch.done():
+            return 0, 0, True
+        pending = []
+        skipped = 0
+        for report_id, url in reports[:INGEST_REPORT_LIMIT]:
+            existing = state.importing.get(report_id)
+            if existing and not existing.done():
+                skipped += 1
+                continue
+            pending.append((report_id, url))
+        if not pending:
+            return 0, skipped, False
+
+        task = asyncio.create_task(
+            self._run_import_batch(state, pending, channel),
+            name=f"carter-import-batch-{state.guild_id}",
+        )
+        for report_id, _url in pending:
+            state.importing[report_id] = task
+        state.history_import_task = task
+        state.import_tasks.add(task)
+
+        def release_reservations(done_task):
+            state.import_tasks.discard(done_task)
+            if state.history_import_task is done_task:
+                state.history_import_task = None
+            for report_id, _url in pending:
+                if state.importing.get(report_id) is done_task:
+                    state.importing.pop(report_id, None)
+
+        task.add_done_callback(release_reservations)
+        return len(pending), skipped, False
+
+    async def _run_import_batch(self, state, reports, channel):
+        """Run oldest first so the newest historical report remains selected."""
+        task = asyncio.current_task()
+        try:
+            for report_id, url in reversed(reports):
+                try:
+                    await self._run_import(state, url, report_id, channel)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    log.warning(
+                        "Unexpected backend import failure: guild=%s report=%s cause=%s",
+                        state.guild_id, report_id, type(error).__name__,
+                    )
+                    await self._report_import_failure(
+                        state, report_id, channel, AnalysisClientError("import_failed"),
+                    )
+        finally:
+            for report_id, _url in reports:
+                if state.importing.get(report_id) is task:
+                    state.importing.pop(report_id, None)
+
     @staticmethod
     def _remember_import_task(state, report_id, task):
         state.importing[report_id] = task
         state.import_tasks.add(task)
-        task.add_done_callback(state.import_tasks.discard)
+
+        def release_reservation(done_task):
+            state.import_tasks.discard(done_task)
+            if state.importing.get(report_id) is done_task:
+                state.importing.pop(report_id, None)
+
+        task.add_done_callback(release_reservation)
 
     async def _run_import(self, state, url, report_id, channel):
         try:
-            queued = await self.raid.submit_report(url)
-            job_id = str(queued.tool_context["job_id"])
-            await self._poll_import(state, job_id, report_id, channel)
-        except AnalysisClientError as error:
-            await self._report_import_failure(state, report_id, channel, error)
+            async with self.import_lock:
+                try:
+                    queued = await self.raid.submit_report(url)
+                    job_id = str(queued.tool_context["job_id"])
+                    await self._poll_import(state, job_id, report_id, channel)
+                except AnalysisClientError as error:
+                    await self._report_import_failure(state, report_id, channel, error)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    log.warning(
+                        "Unexpected backend import failure: guild=%s report=%s cause=%s",
+                        state.guild_id, report_id, type(error).__name__,
+                    )
+                    await self._report_import_failure(
+                        state, report_id, channel, AnalysisClientError("import_failed"),
+                    )
         finally:
             state.importing.pop(report_id, None)
+
+    async def _poll_import_locked(self, state, job_id, report_id, channel, lock_guard):
+        """Keep Carter's global import slot until a directly submitted job finishes."""
+        try:
+            await self._poll_import(state, job_id, report_id, channel)
+        finally:
+            if lock_guard["held"]:
+                lock_guard["held"] = False
+                self.import_lock.release()
 
     async def _poll_import(self, state, job_id, report_id, channel):
         try:
@@ -1005,10 +1232,12 @@ def _message_report_urls(message):
             try:
                 walk(to_dict(), depth + 1)
             except Exception:
-                return
-        else:
-            for attribute in ("url", "proxy_url", "description", "title", "content"):
-                walk(getattr(value, attribute, None), depth + 1)
+                pass
+        for attribute in (
+                "url", "proxy_url", "description", "title", "content", "name", "value",
+                "fields", "embeds", "attachments", "stickers", "components",
+                "message_snapshots"):
+            walk(getattr(value, attribute, None), depth + 1)
 
     for root in roots:
         walk(root)
