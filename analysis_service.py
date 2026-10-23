@@ -9,6 +9,7 @@ import re
 
 from encounter_parser import EncounterRef, EncounterTimeline, load_saved_analysis
 from timer_export import build_timer_export
+from death_answer import build_death_answer
 from warcraft_logs_importer import metadata_path
 
 
@@ -300,6 +301,10 @@ class AnalysisService:
                            player_name=None, death_number=None, seconds_before=10):
         timeline = self._timeline(report_id, fight_id)
         death = self._death(timeline, death_id, player_id, player_name, death_number)
+        return self._death_analysis_payload(death, self._base(report_id, fight_id), seconds_before)
+
+    @staticmethod
+    def _death_analysis_payload(death, base, seconds_before):
         window = min(max(0.0, float(seconds_before)), MAX_DEATH_CONTEXT)
         result = asdict(death)
         damage = [event for event in result['damage_before_death']
@@ -315,7 +320,7 @@ class AnalysisService:
                             'name': result.pop('player_name'),
                             'class': result.pop('class_name')}
         result['time_seconds'] = result.pop('time')
-        return {**self._base(report_id, fight_id), 'units': {'time': 'seconds'},
+        return {**base, 'units': {'time': 'seconds'},
                 'seconds_before': window, 'event_limit': MAX_DEATH_CONTEXT_EVENTS,
                 'truncated': {'damage': len(damage) > MAX_DEATH_CONTEXT_EVENTS,
                               'healing': len(healing) > MAX_DEATH_CONTEXT_EVENTS}, **result}
@@ -359,6 +364,11 @@ class AnalysisService:
                          seconds_after=2, resolution_ms=500):
         timeline = self._timeline(report_id, fight_id)
         death = self._death(timeline, death_id=death_id)
+        return self._death_replay_payload(timeline, death, self._base(report_id, fight_id),
+                                          seconds_before, seconds_after, resolution_ms)
+
+    def _death_replay_payload(self, timeline, death, base, seconds_before,
+                              seconds_after, resolution_ms):
         before, after = max(0.0, float(seconds_before)), max(0.0, float(seconds_after))
         if before + after > MAX_REPLAY_WINDOW:
             scale = MAX_REPLAY_WINDOW / (before + after)
@@ -373,11 +383,31 @@ class AnalysisService:
         events.append({'t': death.time, 'type': 'death', 'player': death.player_name,
                        'death_id': death.death_id})
         events.sort(key=lambda item: item['t'])
-        return {**self._base(report_id, fight_id), 'death_id': death.death_id,
+        return {**base, 'death_id': death.death_id,
                 'start': start, 'end': end, 'resolution_ms': resolution,
                 'actor_limit': MAX_REPLAY_ACTORS,
                 'truncated': actors_truncated,
                 'actors': actors, 'events': events}
+
+    def get_death_answer(self, report_id, fight_id, death_id, seconds_before=10):
+        timeline = self._timeline(report_id, fight_id)
+        return self._death_answer_payload(timeline, self._base(report_id, fight_id),
+                                          death_id, seconds_before)
+
+    def get_live_death_answer(self, death_id, seconds_before=10):
+        timeline, status = self._live_snapshot()
+        return self._death_answer_payload(timeline, self._live_base(timeline, status),
+                                          death_id, seconds_before)
+
+    def _death_answer_payload(self, timeline, base, death_id, seconds_before):
+        # Capture one timeline so live analysis, replay, and image agree.
+        death = self._death(timeline, death_id=death_id)
+        analysis = self._death_analysis_payload(death, base, seconds_before)
+        replay = self._death_replay_payload(timeline, death, base,
+                                             analysis['seconds_before'], 0, 100)
+        names = {p.guid: p.name for p in timeline.players}
+        names.update({p.guid: p.name for p in timeline.boss_profiles})
+        return {**base, **build_death_answer(analysis, replay, names)}
 
     def compare_player_deaths(self, report_id, fight_ids, player_id=None, player_name=None):
         selected = self._fight_ids(fight_ids)

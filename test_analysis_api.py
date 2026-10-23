@@ -1,13 +1,17 @@
+import base64
 import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from xml.etree import ElementTree
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from analysis_api import create_server
 from analysis_service import AnalysisService, ServiceError
+from death_answer import build_death_answer
 from encounter_parser import analyze_encounter, scan_encounters
 from warcraft_logs_importer import metadata_path
 from test_timer_export import sample_draft
@@ -116,6 +120,64 @@ class AnalysisApiTests(unittest.TestCase):
                         encoding='utf-8')
         timeline = analyze_encounter(path, scan_encounters(path)[0])
         self.assertEqual({boss.guid for boss in timeline.bosses}, {'WCL-2:1', 'WCL-2:2'})
+
+    def test_death_answer_bundles_evidence_and_image(self):
+        death_id = self.service.list_deaths('ApiTest01', 11)['deaths'][0]['death_id']
+        payload = self.service.get_death_answer('ApiTest01', 11, death_id)
+        self.assertIn('Heavy Slam', payload['answer']['text'])
+        self.assertIn('Tiny Burn', payload['answer']['text'])
+        self.assertEqual(payload['analysis']['position']['x'], 2)
+        self.assertEqual(payload['image']['status'], 'available')
+        svg = base64.b64decode(payload['image']['data']).decode()
+        ElementTree.fromstring(svg)
+        self.assertIn('Alex', svg)
+        self.assertEqual(payload['replay']['end'], payload['analysis']['time_seconds'])
+        for samples in payload['replay']['actors'].values():
+            self.assertTrue(all(p['t'] <= payload['analysis']['time_seconds'] for p in samples))
+        self.assertEqual(payload['image']['map_id'], 7)
+        server = create_server(self.root, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = (f'http://127.0.0.1:{server.server_port}/api/v1/reports/'
+                   f'ApiTest01/fights/11/deaths/{death_id}/answer?seconds_before=100')
+            with urlopen(url) as response:
+                result = json.load(response)
+            self.assertEqual(result['analysis']['seconds_before'], 30)
+            self.assertEqual(result['image']['mime_type'], 'image/svg+xml')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_map_handles_missing_stale_other_floor_and_untrusted_names(self):
+        death_id = self.service.list_deaths('ApiTest01', 11)['deaths'][0]['death_id']
+        payload = self.service.get_death_answer('ApiTest01', 11, death_id)
+        analysis, replay = payload['analysis'], payload['replay']
+        replay['actors'] = {
+            'other-floor': [{'t': 3, 'x': 10, 'y': 10, 'map_id': 8, 'sample_age_seconds': 0}],
+            'stale': [{'t': 0, 'x': 10, 'y': 10, 'map_id': 7, 'sample_age_seconds': 4}],
+            'future': [{'t': 4, 'x': 99, 'y': 99, 'map_id': 7, 'sample_age_seconds': 0}]}
+        analysis['player']['name'] = '<script>unsafe</script>'
+        result = build_death_answer(analysis, replay, {})
+        svg = base64.b64decode(result['image']['data']).decode()
+        root = ElementTree.fromstring(svg)
+        self.assertEqual(len(root.findall('.//{http://www.w3.org/2000/svg}circle')), 0)
+        self.assertNotIn('<script>', svg)
+        analysis['position'] = None
+        result = build_death_answer(analysis, replay, {})
+        self.assertEqual(result['image']['status'], 'unavailable')
+        self.assertIn('Tiny Burn', result['answer']['text'])
+
+    def test_live_answer_uses_one_snapshot(self):
+        timeline = self.service._timeline('ApiTest01', 11)
+        death_id = timeline.deaths[0].death_id
+        with patch.object(self.service, '_live_snapshot', return_value=(timeline, {})) as snapshot:
+            with patch.object(self.service, '_live_base', return_value={'schema_version': 1}):
+                result = self.service.get_live_death_answer(death_id)
+        snapshot.assert_called_once()
+        self.assertEqual(result['death_id'], death_id)
+        self.assertEqual(result['image']['status'], 'available')
 
     def test_restricted_storage_and_structured_errors(self):
         with self.assertRaises(ServiceError) as raised:

@@ -90,6 +90,10 @@ class AnalysisRequestHandler(BaseHTTPRequestHandler):
         if path == '/api/v1/live/deaths':
             return self.service.list_live_deaths(self._value(query, 'player_id'),
                                                  self._value(query, 'player_name'))
+        match = re.fullmatch(r'/api/v1/live/deaths/([^/]+)/answer', path)
+        if match:
+            return self.service.get_live_death_answer(
+                unquote(match.group(1)), self._value(query, 'seconds_before', 10, float))
         match = re.fullmatch(r'/api/v1/live/deaths/([^/]+)/replay', path)
         if match:
             return self.service.get_live_death_replay(
@@ -151,6 +155,11 @@ class AnalysisRequestHandler(BaseHTTPRequestHandler):
             return self.service.list_deaths(
                 unquote(match.group(1)), int(match.group(2)),
                 self._value(query, 'player_id'), self._value(query, 'player_name'))
+        match = re.fullmatch(r'/api/v1/reports/([^/]+)/fights/(\d+)/deaths/([^/]+)/answer', path)
+        if match:
+            return self.service.get_death_answer(
+                unquote(match.group(1)), int(match.group(2)), unquote(match.group(3)),
+                self._value(query, 'seconds_before', 10, float))
         match = re.fullmatch(r'/api/v1/reports/([^/]+)/fights/(\d+)/deaths/([^/]+)/replay', path)
         if match:
             return self.service.get_death_replay(

@@ -84,6 +84,7 @@ Available endpoints are:
 - `POST /reports/{report_id}/mechanics/compare`
 - `GET .../fights/{fight_id}/deaths` and `GET .../deaths/{death_id}`
 - `GET .../deaths/{death_id}/replay?before=8&after=2&resolution_ms=500`
+- `GET .../deaths/{death_id}/answer?seconds_before=10`
 - `POST /reports/{report_id}/deaths/compare`
 
 Comparison requests use JSON such as:
@@ -116,6 +117,30 @@ recent event as the likely primary cause. Inferred conclusions carry provenance,
 confidence, and a reason. Positions always use the newest sample at or before
 death. Distances are computed only between actors on the same map; stale samples
 remain labeled with their age and confidence.
+
+For answer generation, use the `/answer` endpoint to receive the narrative and
+visual together in one JSON payload. This also works at
+`GET /api/v1/live/deaths/{death_id}/answer?seconds_before=10`.
+The Python equivalents are `AnalysisService.get_death_answer(report_id, fight_id,
+death_id)` and `get_live_death_answer(death_id)`. Live answers capture one timeline
+snapshot for consistent analysis, replay, and image evidence.
+
+The response includes `answer.text` (an evidence-based summary), `analysis` (full
+death context, including provenance and confidence), `replay` (positions and
+mechanics leading up to death), and `image`. When available, `image` contains
+`mime_type: "image/svg+xml"`, `encoding: "base64"`, `data`, `width`, `height`,
+`alt_text`, map/time, and victim position confidence/sample age. A client can
+display it using `src="data:image/svg+xml;base64," + payload.image.data` alongside
+`payload.answer.text`, or pass these fields into its answer-generation layer.
+There is no external language-model call in this endpoint.
+
+The image is a schematic of recorded movement and actor positions on the
+victim's floor, with a red cross at the death position. It uses no samples after
+death and omits other actors whose latest position is more than three seconds
+old. It does not provide arena artwork or inferred mechanic shapes. If no usable
+death position exists, `image.status` is `"unavailable"` with a `reason`; the
+answer, analysis, and replay are still returned. The context window defaults to
+10 seconds and caps at 30, with replay samples every 100 ms.
 
 ### Live local log API
 
