@@ -74,6 +74,21 @@ def group_cross_report_encounters(paths):
     return sorted(result, key=lambda item: (item['name'].casefold(), item['difficulty']))
 
 
+def report_path_key(path):
+    """Return a stable local identity for a report cache path."""
+    path = Path(path)
+    try:
+        path = path.resolve()
+    except OSError:
+        path = path.absolute()
+    return str(path).casefold()
+
+
+def filter_checked_report_paths(paths, checked_keys):
+    """Return report paths whose visible checkbox is selected."""
+    return [Path(path) for path in paths if report_path_key(path) in checked_keys]
+
+
 def selectable_report_paths(paths):
     """Return unique existing Warcraft Logs caches, newest first."""
     reports = []
@@ -82,11 +97,7 @@ def selectable_report_paths(paths):
         path = Path(value)
         if not path.is_file() or not path.name.lower().endswith('.wcl.json'):
             continue
-        try:
-            identity = path.resolve()
-        except OSError:
-            identity = path.absolute()
-        key = str(identity).casefold()
+        key = report_path_key(path)
         if key in seen:
             continue
         seen.add(key)
@@ -1548,6 +1559,8 @@ class CrossReportLearnerWindow:
         self.root.geometry('1040x780')
         self.root.minsize(880, 650)
         self.paths = selectable_report_paths(paths or [])[:5]
+        self.checked_report_keys = {report_path_key(path) for path in self.paths}
+        self.scan_paths = []
         self.groups = []
         self.messages = queue.SimpleQueue()
         self.busy = False
@@ -1564,13 +1577,14 @@ class CrossReportLearnerWindow:
 
         reports = ttk.LabelFrame(self.root, text='Selected report caches', padding=8)
         reports.pack(fill='x', padx=12, pady=(0, 10))
-        report_columns = ('report', 'modified', 'folder')
+        report_columns = ('use', 'report', 'modified', 'folder')
         self.report_table = ttk.Treeview(
             reports, columns=report_columns, show='headings', selectmode='extended', height=5)
         report_settings = {
-            'report': ('Report file', 310, 'w'),
+            'use': ('Use', 55, 'center'),
+            'report': ('Report file', 270, 'w'),
             'modified': ('Modified (newest first)', 205, 'center'),
-            'folder': ('Folder', 430, 'w'),
+            'folder': ('Folder', 420, 'w'),
         }
         for column, (label, width, anchor) in report_settings.items():
             self.report_table.heading(column, text=label)
@@ -1581,6 +1595,7 @@ class CrossReportLearnerWindow:
         report_scroll.grid(row=0, column=1, sticky='ns')
         reports.columnconfigure(0, weight=1)
         self.report_table.bind('<<TreeviewSelect>>', self.report_selection_changed)
+        self.report_table.bind('<Button-1>', self.toggle_report_checkbox, add='+')
 
         report_actions = ttk.Frame(reports)
         report_actions.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(8, 0))
@@ -1588,11 +1603,19 @@ class CrossReportLearnerWindow:
             report_actions, text='Add report files...', command=self.add_report_files)
         self.add_report_button.pack(side='left')
         self.remove_report_button = ttk.Button(
-            report_actions, text='Remove selected', command=self.remove_selected_reports,
+            report_actions, text='Remove highlighted', command=self.remove_selected_reports,
             state='disabled')
         self.remove_report_button.pack(side='left', padx=(8, 0))
+        self.select_all_button = ttk.Button(
+            report_actions, text='Select all', command=self.select_all_reports,
+            state='normal' if self.paths else 'disabled')
+        self.select_all_button.pack(side='left', padx=(8, 0))
+        self.select_none_button = ttk.Button(
+            report_actions, text='Select none', command=self.select_no_reports,
+            state='normal' if self.paths else 'disabled')
+        self.select_none_button.pack(side='left', padx=(8, 0))
         self.clear_reports_button = ttk.Button(
-            report_actions, text='Clear', command=self.clear_reports,
+            report_actions, text='Clear list', command=self.clear_reports,
             state='normal' if self.paths else 'disabled')
         self.clear_reports_button.pack(side='left', padx=(8, 0))
         ttk.Label(report_actions, text='Expected file type: *.wcl.json').pack(side='right')
@@ -1636,27 +1659,43 @@ class CrossReportLearnerWindow:
 
     def refresh_report_table(self):
         self.paths = selectable_report_paths(self.paths)
+        valid_keys = {report_path_key(path) for path in self.paths}
+        self.checked_report_keys.intersection_update(valid_keys)
         self.report_table.delete(*self.report_table.get_children())
         for index, path in enumerate(self.paths):
+            checked = report_path_key(path) in self.checked_report_keys
             self.report_table.insert('', 'end', iid=str(index), values=(
-                path.name, report_modified_text(path), str(path.parent),
+                '☑' if checked else '☐', path.name, report_modified_text(path), str(path.parent),
             ))
+        checked_count = len(self.checked_report_paths())
         self.scan_button.configure(
-            state='normal' if self.paths and not self.busy else 'disabled')
+            state='normal' if checked_count and not self.busy else 'disabled')
         self.clear_reports_button.configure(
             state='normal' if self.paths and not self.busy else 'disabled')
         self.add_report_button.configure(
             state='normal' if len(self.paths) < 5 and not self.busy else 'disabled')
+        self.select_all_button.configure(
+            state='normal' if self.paths and not self.busy else 'disabled')
+        self.select_none_button.configure(
+            state='normal' if checked_count and not self.busy else 'disabled')
         self.report_selection_changed()
         if self.paths:
-            self.status.set(f'{len(self.paths)} reports selected. Click Scan reports when ready.')
+            self.status.set(f'{checked_count} of {len(self.paths)} reports selected. '
+                            'Click a checkbox to include or exclude a report.')
         else:
             self.status.set('Add one or more Warcraft Logs .wcl.json report caches.')
 
-    def reports_changed(self):
+    def checked_report_paths(self):
+        return filter_checked_report_paths(self.paths, self.checked_report_keys)
+
+    def clear_scan_results(self):
         self.groups = []
+        self.scan_paths = []
         self.table.delete(*self.table.get_children())
         self.learn_button.configure(state='disabled')
+
+    def reports_changed(self):
+        self.clear_scan_results()
         self.refresh_report_table()
 
     def add_report_files(self):
@@ -1688,7 +1727,40 @@ class CrossReportLearnerWindow:
             )
             return
         self.paths = combined
+        self.checked_report_keys.update(report_path_key(path) for path in chosen)
         self.reports_changed()
+
+    def toggle_report_checkbox(self, event):
+        if self.busy or self.report_table.identify_region(event.x, event.y) != 'cell':
+            return None
+        if self.report_table.identify_column(event.x) != '#1':
+            return None
+        iid = self.report_table.identify_row(event.y)
+        if not iid:
+            return 'break'
+        path = self.paths[int(iid)]
+        key = report_path_key(path)
+        if key in self.checked_report_keys:
+            self.checked_report_keys.remove(key)
+        else:
+            self.checked_report_keys.add(key)
+        self.clear_scan_results()
+        self.refresh_report_table()
+        return 'break'
+
+    def select_all_reports(self):
+        if self.busy:
+            return
+        self.checked_report_keys = {report_path_key(path) for path in self.paths}
+        self.clear_scan_results()
+        self.refresh_report_table()
+
+    def select_no_reports(self):
+        if self.busy:
+            return
+        self.checked_report_keys.clear()
+        self.clear_scan_results()
+        self.refresh_report_table()
 
     def report_selection_changed(self, _event=None):
         self.remove_report_button.configure(
@@ -1700,13 +1772,16 @@ class CrossReportLearnerWindow:
         selected = {int(iid) for iid in self.report_table.selection()}
         if not selected:
             return
+        removed = [path for index, path in enumerate(self.paths) if index in selected]
         self.paths = [path for index, path in enumerate(self.paths) if index not in selected]
+        self.checked_report_keys.difference_update(report_path_key(path) for path in removed)
         self.reports_changed()
 
     def clear_reports(self):
         if self.busy:
             return
         self.paths = []
+        self.checked_report_keys.clear()
         self.reports_changed()
 
     def set_report_controls(self, enabled):
@@ -1715,14 +1790,19 @@ class CrossReportLearnerWindow:
             state='normal' if enabled and len(self.paths) < 5 else 'disabled')
         self.clear_reports_button.configure(
             state='normal' if enabled and self.paths else 'disabled')
+        self.select_all_button.configure(
+            state='normal' if enabled and self.paths else 'disabled')
+        self.select_none_button.configure(
+            state='normal' if enabled and self.checked_report_paths() else 'disabled')
         self.remove_report_button.configure(
             state='normal' if enabled and self.report_table.selection() else 'disabled')
 
     def start_scan(self):
-        if self.busy or not self.paths:
+        selected_paths = self.checked_report_paths()
+        if self.busy or not selected_paths:
             return
-        self.groups = []
-        self.table.delete(*self.table.get_children())
+        self.clear_scan_results()
+        self.scan_paths = selected_paths
         selected = self.table.selection()
         if selected:
             self.table.selection_remove(*selected)
@@ -1730,13 +1810,13 @@ class CrossReportLearnerWindow:
         self.set_report_controls(False)
         self.scan_button.configure(state='disabled')
         self.learn_button.configure(state='disabled')
-        self.status.set(f'Reading encounter indexes from {len(self.paths)} reports...')
+        self.status.set(f'Reading encounter indexes from {len(self.scan_paths)} reports...')
         self.progress.start(10)
         threading.Thread(target=self.scan_groups, daemon=True).start()
 
     def scan_groups(self):
         try:
-            self.messages.put(('groups', group_cross_report_encounters(self.paths)))
+            self.messages.put(('groups', group_cross_report_encounters(self.scan_paths)))
         except Exception as error:
             self.messages.put(('error', f'Could not read the report indexes:\n{error}'))
 
@@ -1755,7 +1835,8 @@ class CrossReportLearnerWindow:
         self.busy = busy
         self.status.set(message)
         self.learn_button.configure(state='disabled')
-        self.scan_button.configure(state='disabled' if busy or not self.paths else 'normal')
+        self.scan_button.configure(
+            state='disabled' if busy or not self.checked_report_paths() else 'normal')
         self.set_report_controls(not busy)
         if busy:
             self.progress.start(10)
@@ -1800,7 +1881,8 @@ class CrossReportLearnerWindow:
                         ))
                     self.busy = False
                     self.progress.stop()
-                    self.scan_button.configure(state='normal' if self.paths else 'disabled')
+                    self.scan_button.configure(
+                        state='normal' if self.checked_report_paths() else 'disabled')
                     self.set_report_controls(True)
                     eligible = sum(1 for group in self.groups if len(group['pulls']) >= 3)
                     self.status.set(f'Found {len(self.groups)} encounter groups; '
