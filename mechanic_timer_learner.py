@@ -14,6 +14,8 @@ from pathlib import Path
 import re
 import statistics
 
+from guide_profile import (annotate_timer_candidates, guide_mechanic_index,
+                           load_guide_profile, normalize_mechanic_name)
 from timer_export import build_timer_export, save_timer_export
 from warcraft_logs_importer import load_cache
 
@@ -163,13 +165,23 @@ def _summarize_report(path, encounter_id, difficulty, selected_fights, config):
                     'preceding_cast': cast,
                 })
             abilities_in_fight[ability_id] = bursts
+        casts_in_fight = {}
+        for ability_id in {cast['ability_id'] for cast in casts if cast['ability_id'] > 0}:
+            ability_casts = [cast for cast in casts if cast['ability_id'] == ability_id]
+            begin_casts = [cast for cast in ability_casts if cast['type'] == 'begincast']
+            selected_casts = begin_casts or ability_casts
+            casts_in_fight[ability_id] = [
+                {'time': cast['time'], 'event_type': cast['type']}
+                for cast in sorted(selected_casts, key=lambda item: item['time'])
+            ]
         summaries.append({
             'report_id': str(report.get('code') or path.stem), 'fight_id': fight_id,
             'name': str(fight.get('name') or 'Encounter'), 'duration': duration,
             'kill': bool(fight.get('kill')), 'group_size': group_size,
             'start_time_ms': start if has_start else None,
             'end_time_ms': end if has_end else None,
-            'abilities': abilities_in_fight, 'ability_names': abilities,
+            'abilities': abilities_in_fight, 'casts': casts_in_fight,
+            'ability_names': abilities,
         })
     return summaries
 
@@ -228,7 +240,8 @@ def _ability_evidence(ability_id, fights, config):
                 if fight['abilities'].get(ability_id)]
     name = next((fight['ability_names'].get(ability_id) for fight, _bursts in observed),
                 f'Spell {ability_id}')
-    result = {'ability_id': ability_id, 'ability': name, 'accepted': False,
+    result = {'ability_id': ability_id, 'ability': name,
+              'observation_kind': 'damage_burst', 'accepted': False,
               'reasons': [], 'evidence': {}}
     if len(observed) < config.minimum_pulls:
         result['reasons'].append('fewer_than_minimum_observed_pulls')
@@ -324,13 +337,110 @@ def _ability_evidence(ability_id, fights, config):
     return result
 
 
+def _cast_evidence(ability_id, fights, config):
+    """Learn pull-relative occurrences from boss cast starts without damage gating."""
+    observed = [(fight, fight['casts'][ability_id]) for fight in fights
+                if fight['casts'].get(ability_id)]
+    name = next((fight['ability_names'].get(ability_id) for fight, _casts in observed),
+                f'Spell {ability_id}')
+    result = {'ability_id': ability_id, 'ability': name,
+              'observation_kind': 'boss_cast_start', 'accepted': False,
+              'reasons': [], 'evidence': {}}
+    if len(observed) < config.minimum_pulls:
+        result['reasons'].append('fewer_than_minimum_observed_pulls')
+        return result
+    first_times = [casts[0]['time'] for _fight, casts in observed]
+    first_timing = robust_timing(first_times)
+    eligible = [fight for fight in fights
+                if fight['duration'] + config.maximum_timing_deviation >= first_timing['median']]
+    eligible_observed = [(fight, fight['casts'][ability_id]) for fight in eligible
+                         if fight['casts'].get(ability_id)]
+    pull_coverage = len(eligible_observed) / max(1, len(eligible))
+    result['evidence'].update({
+        'selected_pulls': len(fights), 'observed_pulls': len(observed),
+        'eligible_pulls': len(eligible), 'eligible_observed_pulls': len(eligible_observed),
+        'pull_coverage': pull_coverage, 'first_occurrence': first_timing,
+        'timing_source': 'boss_begincast_or_cast',
+    })
+    if pull_coverage < config.minimum_pull_coverage:
+        result['reasons'].append('insufficient_pull_coverage')
+    if first_timing['p90_absolute_deviation'] > config.maximum_timing_deviation:
+        result['reasons'].append('inconsistent_first_occurrence')
+    if first_timing['median'] < config.minimum_actionable_warning_seconds:
+        result['reasons'].append('insufficient_actionable_warning_time')
+
+    intervals = []
+    repeating_pulls = 0
+    for _fight, casts in eligible_observed:
+        if len(casts) > 1:
+            repeating_pulls += 1
+            intervals.extend(casts[index]['time'] - casts[index - 1]['time']
+                             for index in range(1, len(casts)))
+    interval_evidence = None
+    stable_repeat = False
+    if repeating_pulls >= config.minimum_pulls and intervals:
+        timing = robust_timing(intervals)
+        mean = statistics.mean(intervals)
+        cv = statistics.pstdev(intervals) / mean if mean > 0 and len(intervals) > 1 else 0.0
+        interval_evidence = {**timing, 'coefficient_of_variation': cv,
+                             'pulls_with_repeats': repeating_pulls}
+        stable_repeat = (timing['p90_absolute_deviation'] <= config.maximum_timing_deviation
+                         and cv <= config.maximum_interval_cv)
+        if not stable_repeat:
+            result['reasons'].append('inconsistent_repeat_interval')
+    result['evidence']['repeat_interval'] = interval_evidence
+
+    predictions = []
+    maximum_occurrences = max(len(casts) for _fight, casts in eligible_observed)
+    for occurrence in range(maximum_occurrences):
+        pairs = [(fight, casts[occurrence]['time']) for fight, casts in eligible_observed
+                 if len(casts) > occurrence]
+        if len(pairs) < config.minimum_pulls:
+            break
+        timing = robust_timing([value for _fight, value in pairs])
+        eligible_for_occurrence = [fight for fight in eligible
+                                   if fight['duration'] + config.maximum_timing_deviation >=
+                                   timing['median']]
+        eligible_keys = {(fight['report_id'], fight['fight_id'])
+                         for fight in eligible_for_occurrence}
+        supported_values = [value for fight, value in pairs
+                            if (fight['report_id'], fight['fight_id']) in eligible_keys]
+        if len(supported_values) < config.minimum_pulls:
+            break
+        timing = robust_timing(supported_values)
+        coverage = len(supported_values) / max(1, len(eligible_for_occurrence))
+        if (coverage < config.minimum_pull_coverage or
+                timing['p90_absolute_deviation'] > config.maximum_timing_deviation):
+            break
+        if occurrence > 0 and not stable_repeat:
+            break
+        predictions.append({'occurrence': occurrence + 1, 'time': timing['median'],
+                            'pulls': len(supported_values), 'coverage': coverage,
+                            'timing': timing})
+    result['evidence']['predicted_occurrences'] = predictions
+    blocking = [reason for reason in result['reasons'] if reason != 'inconsistent_repeat_interval']
+    if not blocking and predictions:
+        result['accepted'] = True
+        result['confidence'] = ('high' if len(eligible_observed) >= 5 and
+                                (maximum_occurrences == 1 or stable_repeat) else 'moderate')
+        if not stable_repeat and maximum_occurrences > 1:
+            result['notes'] = [
+                'Only the stable first cast was learned; repeat timers were rejected.']
+    return result
+
+
+def _candidate_occurrences(fight, candidate):
+    collection = 'casts' if candidate.get('observation_kind') == 'boss_cast_start' else 'abilities'
+    return fight[collection].get(candidate['ability_id'], [])
+
+
 def _stable_overlaps(accepted, fights, config):
     groups = []
     for left, right in itertools.combinations(accepted, 2):
         common = []
         for fight in fights:
-            left_bursts = fight['abilities'].get(left['ability_id'], [])
-            right_bursts = fight['abilities'].get(right['ability_id'], [])
+            left_bursts = _candidate_occurrences(fight, left)
+            right_bursts = _candidate_occurrences(fight, right)
             if not left_bursts or not right_bursts:
                 continue
             difference = min(abs(a['time'] - b['time']) for a in left_bursts for b in right_bursts)
@@ -348,9 +458,10 @@ def _stable_overlaps(accepted, fights, config):
 
 
 def learn_timer_script(paths, encounter_id, difficulty=None, fight_ids=None, config=None,
-                       max_workers=MAX_ANALYSIS_WORKERS, progress=None):
+                       max_workers=MAX_ANALYSIS_WORKERS, progress=None, guide_profile=None):
     config = config or LearnerConfig()
     config.validate()
+    guide = load_guide_profile(guide_profile) if guide_profile is not None else None
     selected = set(int(item) for item in (fight_ids or []))
     paths = [Path(path) for path in paths]
     if selected and len(paths) > 1:
@@ -361,8 +472,26 @@ def learn_timer_script(paths, encounter_id, difficulty=None, fight_ids=None, con
     if len(fights) < config.minimum_pulls:
         raise ValueError(f'At least {config.minimum_pulls} matching pulls are required; found {len(fights)}.')
     encounter_names = sorted({fight['name'] for fight in fights})
-    ability_ids = sorted({ability_id for fight in fights for ability_id in fight['abilities']})
-    candidates = [_ability_evidence(ability_id, fights, config) for ability_id in ability_ids]
+    damage_ability_ids = {ability_id for fight in fights for ability_id in fight['abilities']}
+    guide_cast_ids = set()
+    if guide is not None:
+        guide_index = guide_mechanic_index(guide)
+        for fight in fights:
+            for ability_id in fight['casts']:
+                mechanic = guide_index.get(normalize_mechanic_name(
+                    fight['ability_names'].get(ability_id, '')))
+                policy = (mechanic or {}).get('timer_policy') or {}
+                if policy.get('candidate') and policy.get('mode') in ('observed_static', 'phase'):
+                    guide_cast_ids.add(ability_id)
+    ability_ids = sorted(damage_ability_ids | guide_cast_ids)
+    candidates = []
+    for ability_id in ability_ids:
+        if ability_id in guide_cast_ids and any(
+                fight['casts'].get(ability_id) for fight in fights):
+            candidates.append(_cast_evidence(ability_id, fights, config))
+        else:
+            candidates.append(_ability_evidence(ability_id, fights, config))
+    guide_context = annotate_timer_candidates(candidates, guide) if guide is not None else None
     accepted = [candidate for candidate in candidates if candidate['accepted']]
     stable_overlaps = _stable_overlaps(accepted, fights, config)
     mechanics = []
@@ -454,6 +583,7 @@ def learn_timer_script(paths, encounter_id, difficulty=None, fight_ids=None, con
         'encounter_name': encounter_names[0] if len(encounter_names) == 1 else encounter_names,
         'difficulty': difficulty, 'pull_count': len(fights), 'source_fights': source_fights,
         'config': asdict(config),
+        'guide_context': guide_context,
         'accepted_abilities': accepted,
         'rejected_abilities': [candidate for candidate in candidates if not candidate['accepted']],
         'stable_overlaps': stable_overlaps,
@@ -462,6 +592,7 @@ def learn_timer_script(paths, encounter_id, difficulty=None, fight_ids=None, con
             'encounter_name': encounter_names[0] if encounter_names else f'Encounter {encounter_id}',
             'difficulty': difficulty if difficulty is not None else 'any',
             'placeholder': False, 'draft': True, 'enabled': False,
+            'guide_context': guide_context,
             'encounter_triggers': encounter_triggers,
             'warning': ('Generated from repeated pulls. Review before enabling; timers describe '
                         'observed patterns and may change with strategy, phase timing, or game updates.'),
@@ -489,13 +620,16 @@ def main():
     parser.add_argument('--warning-lead', type=float, default=5.0)
     parser.add_argument('--workers', type=int, default=MAX_ANALYSIS_WORKERS,
                         help='Maximum concurrent report-analysis workers (1-5)')
+    parser.add_argument('--guide-profile', type=Path,
+                        help='Optional validated wow-guide-profile/v1 JSON context')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--timer-export', type=Path,
                         help='Also write a portable wow-fight-timer/v1 JSON file')
     args = parser.parse_args()
     config = LearnerConfig(warning_lead_seconds=args.warning_lead)
     result = learn_timer_script(args.reports, args.encounter_id, args.difficulty,
-                                args.fight_id, config, max_workers=args.workers)
+                                args.fight_id, config, max_workers=args.workers,
+                                guide_profile=args.guide_profile)
     output = args.output or Path('mechanic-drafts') / f"{result['draft_id']}.json"
     save_draft(result, output)
     print(f"Wrote {len(result['accepted_abilities'])} accepted and "

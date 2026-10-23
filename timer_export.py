@@ -108,6 +108,7 @@ def build_timer_export(draft, enabled=None):
             'pull_count': int(draft.get('pull_count') or 0),
             'source_fights': list(draft.get('source_fights') or []),
             'analysis': dict(draft.get('analysis') or {}),
+            'guide_context': dict(draft.get('guide_context') or {}),
         },
     }
 

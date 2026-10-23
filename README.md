@@ -279,6 +279,43 @@ restricted runtime cannot create worker processes, the learner falls back to a
 concurrent thread pool. Downloads remain sequential to avoid unnecessary API
 rate-limit pressure.
 
+### Timed-mechanic guide context
+
+Guide text can be curated into the validated `wow-guide-profile/v1` contract
+documented by `guide_profile.schema.json`. The included
+`guide_profiles/zuljan-malacrass.guide.json` converts the supplied Zul'jan and
+Hex Lord Malacrass guide into four phases and timer-relevant mechanic metadata.
+It records static-timer candidates, phase triggers, conditional follow-ups, and
+reactive mechanics. Guide damage numbers are deliberately excluded.
+
+The Cross-report Timer Learner automatically selects the included profile when
+it is the only available `*.guide.json` file. Use **Choose guide profile...** to
+select another profile or **Clear guide** to learn from logs alone. Matching is
+by normalized ability name. Guide context annotates accepted and rejected
+evidence but cannot change acceptance thresholds, supply spell IDs, invent
+pull-relative times, or enable a module. The timer review displays matched guide
+context beside log evidence.
+
+For guide mechanics marked as pull-relative static or phase candidates, the
+learner uses repeated boss `begincast`/`cast` events even when the mechanic has
+no direct damage event. Unguided raid-wide discovery can still use damage events
+as evidence, but damage values never enter the generated timer contract.
+
+Validate or use the profile from the command line:
+
+```powershell
+python guide_profile.py guide_profiles\zuljan-malacrass.guide.json
+python mechanic_timer_learner.py report.wcl.json `
+  --encounter-id 3429 `
+  --difficulty 4 `
+  --guide-profile guide_profiles\zuljan-malacrass.guide.json
+```
+
+Effect durations and tick intervals remain descriptive context. Only repeated
+combat-log observations can become encounter-relative timer offsets. Runtime
+`wow-fight-timer/v1` exports contain triggers, callout times, ability IDs, and
+messages; they do not contain damage parameters.
+
 Generate a draft for one encounter and difficulty:
 
 ```powershell

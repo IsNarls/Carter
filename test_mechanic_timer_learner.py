@@ -6,6 +6,7 @@ from pathlib import Path
 from analysis_service import AnalysisService, ServiceError
 from mechanic_timer_learner import learn_timer_script, save_draft
 from mechanic_timeline import MechanicScriptRegistry
+from timer_export import build_timer_export
 
 
 def fixture_report(path):
@@ -33,6 +34,9 @@ def fixture_report(path):
                                  'abilityGameID': ability_id, 'amount': amount,
                                  'targetResources': {'hitPoints': 800,
                                                      'maxHitPoints': 1000}})
+        rows.append({'timestamp': fights[-1]['startTime'] + (30 + index * .1) * 1000,
+                     'type': 'begincast', 'sourceID': 99, 'targetID': 0,
+                     'abilityGameID': 103})
         events[str(fight_id)] = rows
     # A short wipe did not live long enough to observe the accepted ability.
     fights.append({'id': 5, 'encounterID': 777, 'name': 'Timer Boss',
@@ -43,12 +47,73 @@ def fixture_report(path):
               'masterData': {'actors': actors, 'abilities': [
                   {'gameID': 100, 'name': 'Raid Blast'},
                   {'gameID': 101, 'name': 'Weak Pulse'},
-                  {'gameID': 102, 'name': 'Random Blast'}]}}
+                  {'gameID': 102, 'name': 'Random Blast'},
+                  {'gameID': 103, 'name': 'Phase Shift'}]}}
     path.write_text(json.dumps({'format': 'wow-log-tools-warcraft-logs-v1',
                                 'report': report, 'eventsByFight': events}), encoding='utf-8')
 
 
+def fixture_guide():
+    return {
+        'format': 'wow-guide-profile/v1',
+        'schema_version': 1,
+        'profile_id': 'timer-boss-guide-v1',
+        'title': 'Timer Boss timed mechanics',
+        'source': {'kind': 'test', 'title': 'Test guide', 'content_sha256': 'a' * 64},
+        'encounter': {'id': 777, 'name': 'Timer Boss', 'aliases': [],
+                      'actors': ['Timer Boss']},
+        'timing_policy': {
+            'encounter_schedule_source': 'observed_logs_only',
+            'effect_intervals_are_cast_intervals': False,
+            'guide_context_can_enable_timer': False,
+            'damage_values_included': False,
+        },
+        'phases': [{'id': 'phase_one', 'name': 'Phase One', 'order': 1,
+                    'actors': ['Timer Boss']}],
+        'mechanics': [
+            {
+                'id': 'raid-blast', 'name': 'Raid Blast', 'actors': ['Timer Boss'],
+                'phases': ['phase_one'],
+                'difficulties': ['mythic'],
+                'categories': ['raidwide'], 'severity': 'critical',
+                'facts': {'effect_duration_seconds': 5},
+                'timer_policy': {'mode': 'observed_static', 'candidate': True,
+                                 'reason': 'Use observed pull timing.'},
+            },
+            {
+                'id': 'phase-shift', 'name': 'Phase Shift', 'actors': ['Timer Boss'],
+                'phases': ['phase_one'],
+                'difficulties': ['mythic'],
+                'categories': ['phase_transition'], 'severity': 'critical',
+                'facts': {},
+                'timer_policy': {'mode': 'phase', 'candidate': True,
+                                 'reason': 'Use observed cast timing.'},
+            },
+        ],
+    }
+
+
 class MechanicTimerLearnerTests(unittest.TestCase):
+    def test_guide_context_annotates_without_adding_damage_to_timer(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            cache = Path(folder) / 'warcraft-logs-TimerRpt1.wcl.json'
+            fixture_report(cache)
+
+            result = learn_timer_script([cache], 777, 16, guide_profile=fixture_guide())
+            export = build_timer_export(result)
+
+            accepted = result['accepted_abilities'][0]
+            self.assertEqual(accepted['guide_context']['mechanic_id'], 'raid-blast')
+            phase = next(item for item in result['accepted_abilities']
+                         if item['ability'] == 'Phase Shift')
+            self.assertEqual(phase['observation_kind'], 'boss_cast_start')
+            self.assertNotIn('median_target_health_fraction', phase['evidence'])
+            self.assertEqual(result['guide_context']['matched_candidate_count'], 2)
+            self.assertEqual(export['provenance']['guide_context']['profile_id'],
+                             'timer-boss-guide-v1')
+            self.assertFalse(any('damage' in key.casefold()
+                                 for item in export['callouts'] for key in item))
+
     def test_conservative_learning_and_partial_wipe_handling(self):
         with tempfile.TemporaryDirectory(dir='.') as folder:
             cache = Path(folder) / 'warcraft-logs-TimerRpt1.wcl.json'
