@@ -1273,16 +1273,25 @@ def main():
     users = {int(user.strip()) for user in raw_users}
     analysis_settings, monitor = analysis_configuration()
     settings, limits = ai_configuration(analysis_tools=analysis_settings.enabled)
-    with (ROOT / ".carter.lock").open("a") as lock:
+    with (ROOT / ".carter.lock").open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("Carter is already running from this directory") from None
-        bot = Carter(
-            legacy_guild_id, users, settings, limits, wake_configuration(),
-            analysis_settings, monitor_log_channel=monitor,
-        )
-        bot.run(token, log_handler=None)
+        lock.seek(0)
+        lock.truncate()
+        lock.write(f"{os.getpid()}\n")
+        lock.flush()
+        try:
+            bot = Carter(
+                legacy_guild_id, users, settings, limits, wake_configuration(),
+                analysis_settings, monitor_log_channel=monitor,
+            )
+            bot.run(token, log_handler=None)
+        finally:
+            lock.seek(0)
+            lock.truncate()
+            lock.flush()
 
 
 if __name__ == "__main__":

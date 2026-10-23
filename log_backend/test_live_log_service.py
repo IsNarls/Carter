@@ -12,12 +12,12 @@ from urllib.request import Request, urlopen
 if __package__:
     from .analysis_api import create_server
     from .analysis_service import AnalysisService, ServiceError
-    from .live_log_service import LiveLogService
+    from .live_log_service import LiveLogService, LIVE_ACCESS_TOKEN_FILENAME
     from .mechanic_timeline import MechanicScriptRegistry
 else:
     from analysis_api import create_server
     from analysis_service import AnalysisService, ServiceError
-    from live_log_service import LiveLogService
+    from live_log_service import LiveLogService, LIVE_ACCESS_TOKEN_FILENAME
     from mechanic_timeline import MechanicScriptRegistry
 
 
@@ -75,6 +75,34 @@ class LiveLogTests(unittest.TestCase):
         with self.log.open('a', encoding='utf-8', newline='') as output:
             output.write(text)
         self.live.scan_once()
+
+    def test_live_access_token_is_private_persistent_and_never_returned(self):
+        token_path = self.root / 'live-analysis' / LIVE_ACCESS_TOKEN_FILENAME
+        token_value = token_path.read_text(encoding='ascii').strip()
+        status = self.live.status()
+        recovered = LiveLogService(self.log, self.root)
+        try:
+            self.assertTrue(status['access_token_ready'])
+            self.assertEqual(
+                status['access_token_fingerprint'], recovered.access_token_fingerprint)
+            self.assertNotIn('access_token', status)
+            self.assertNotIn(token_value, json.dumps(status))
+            self.assertGreaterEqual(len(token_value), 40)
+            if os.name == 'posix':
+                self.assertEqual(token_path.stat().st_mode & 0o077, 0)
+        finally:
+            recovered.stop()
+
+    def test_invalid_existing_live_token_is_not_overwritten(self):
+        storage = self.root / 'invalid-token-storage'
+        token_path = storage / 'live-analysis' / LIVE_ACCESS_TOKEN_FILENAME
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text('existing-invalid-value', encoding='ascii')
+
+        with self.assertRaisesRegex(ValueError, 'invalid'):
+            LiveLogService(self.log, storage)
+
+        self.assertEqual(token_path.read_text(encoding='ascii'), 'existing-invalid-value')
 
     def test_timer_module_can_be_prearmed_before_live_encounter(self):
         registry = MechanicScriptRegistry([{

@@ -13,6 +13,16 @@ Choose a log and then open either the live/replay event viewer or the encounter
 timeline exporter. Timeline scanning and analysis run in the background, so the
 interface remains usable while reading large archives.
 
+When this backend is inside the Carter checkout, the launcher's **Carter
+service** panel can start, stop, and restart Carter. It honors Carter's existing
+single-instance lock, refuses to stop an unverified PID, and writes subprocess
+output to the ignored owner-only `.carter_data/gui-carter.log` file. It does not
+start a second analysis API process; start that service separately before
+Carter.
+
+The same panel can prepare the live-log access token in the default integrated
+storage directory. Only the token fingerprint is displayed.
+
 ## Importing a Warcraft Logs report
 
 Choose **Import Warcraft Logs URL** in the combined GUI to download a public or
@@ -194,6 +204,14 @@ immutable analysis snapshots. Completed or interrupted pulls are written
 atomically under the managed `live-analysis` directory. Requests never parse
 the growing source file and responses expose only its filename, never its full
 path or raw lines.
+
+On first live-service startup, the follower generates a cryptographically random
+access token at `STORAGE/live-analysis/.live-access-token`. It reuses that token
+across restarts, restricts it to owner-only permissions, and refuses to overwrite
+an existing invalid value. `/api/v1/live/status` exposes only
+`access_token_ready` and `access_token_fingerprint`; the raw token is never
+logged or returned. This is groundwork for later authentication—the current API
+does not enforce the token yet.
 
 Live endpoints are:
 

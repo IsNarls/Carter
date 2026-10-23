@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
+import secrets
 import threading
 import time
 
@@ -27,6 +30,52 @@ else:  # Support direct execution from this directory.
 LIVE_SCHEMA_VERSION = 3
 MAX_UPDATE_HISTORY = 5000
 MAX_COMPLETED_ENCOUNTERS = 20
+LIVE_ACCESS_TOKEN_FILENAME = '.live-access-token'
+LIVE_ACCESS_TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9_-]{40,128}$')
+
+
+def live_access_token_info(storage: Path, *, create=False):
+    """Return non-secret token metadata, optionally creating the private token."""
+    directory = Path(storage).resolve() / 'live-analysis'
+    path = directory / LIVE_ACCESS_TOKEN_FILENAME
+    if not create and not path.exists():
+        return None
+    if path.is_symlink():
+        raise ValueError('Live access token path must not be a symbolic link.')
+    created = False
+    if not path.exists():
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        token = secrets.token_urlsafe(32)
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            token = None
+        else:
+            created = True
+            with os.fdopen(descriptor, 'w', encoding='ascii') as output:
+                output.write(token)
+                output.flush()
+                os.fsync(output.fileno())
+    try:
+        value = path.read_text(encoding='ascii').strip()
+    except (OSError, UnicodeError) as error:
+        raise ValueError('The live access token could not be read safely.') from error
+    if not LIVE_ACCESS_TOKEN_PATTERN.fullmatch(value):
+        raise ValueError('The live access token file is invalid; repair it manually.')
+    try:
+        path.chmod(0o600)
+    except OSError as error:
+        raise ValueError('The live access token permissions could not be secured.') from error
+    return {
+        'path': path,
+        'fingerprint': hashlib.sha256(value.encode('ascii')).hexdigest()[:12],
+        'created': created,
+    }
+
+
+def ensure_live_access_token(storage: Path):
+    """Create or reuse the future live-access token without exposing its value."""
+    return live_access_token_info(storage, create=True)
 
 
 class LiveLogService:
@@ -37,6 +86,9 @@ class LiveLogService:
                  timeline_clock=None):
         self.source = Path(source).resolve() if source else None
         self.storage = Path(storage).resolve() / 'live-analysis'
+        token = ensure_live_access_token(storage)
+        self.access_token_path = token['path']
+        self.access_token_fingerprint = token['fingerprint']
         self.from_end = bool(from_end)
         self.poll_interval = max(0.05, float(poll_interval))
         self.rebuild_interval = max(0.05, float(rebuild_interval))
@@ -349,6 +401,8 @@ class LiveLogService:
             return {
                 'schema_version': LIVE_SCHEMA_VERSION, 'source_type': 'local_live_log',
                 'session_id': self.session_id, 'source_name': self.source_name,
+                'access_token_ready': True,
+                'access_token_fingerprint': self.access_token_fingerprint,
                 'configured': self.configured, 'available': bool(self.source and self.source.is_file()),
                 'encounter_state': self._state, 'cursor': self._cursor,
                 'generated_at': datetime.now(timezone.utc).isoformat(),

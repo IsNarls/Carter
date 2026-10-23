@@ -14,20 +14,24 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 if __package__:
+    from .carter_control import CarterProcessController
     from .combat_log_viewer import Viewer
     from .encounter_parser import (analyze_encounter, scan_encounters,
                                    write_boss_position_csv, write_csv, write_player_csv,
                                    Position, WOW_CLASS_COLORS)
     from .guide_profile import load_guide_profile
+    from .live_log_service import ensure_live_access_token, live_access_token_info
     from .mechanic_timer_learner import learn_timer_script, save_draft
     from .timer_export import TIMER_EXPORT_FORMAT, build_timer_export, save_timer_export
     from .warcraft_logs_importer import (WarcraftLogsClient, download_report_batch,
                                          load_cache, load_credentials, prepare_report_batch)
 else:  # Support direct execution from this directory.
+    from carter_control import CarterProcessController
     from combat_log_viewer import Viewer
     from encounter_parser import (analyze_encounter, scan_encounters, write_boss_position_csv,
                                   write_csv, write_player_csv, Position, WOW_CLASS_COLORS)
     from guide_profile import load_guide_profile
+    from live_log_service import ensure_live_access_token, live_access_token_info
     from mechanic_timer_learner import learn_timer_script, save_draft
     from timer_export import TIMER_EXPORT_FORMAT, build_timer_export, save_timer_export
     from warcraft_logs_importer import (WarcraftLogsClient, download_report_batch,
@@ -2007,10 +2011,17 @@ class Launcher:
     def __init__(self, root, initial=None):
         self.root = root
         root.title('WoW Combat Log Tools')
-        root.geometry('1020x470')
-        root.minsize(900, 430)
+        root.geometry('1020x640')
+        root.minsize(900, 590)
         chosen = initial or default_log()
         self.path = tk.StringVar(value=str(chosen or ''))
+        self.carter = CarterProcessController()
+        self.carter_busy = False
+        self.carter_notice = ''
+        self.service_messages = queue.SimpleQueue()
+        self.carter_status = tk.StringVar(value='Carter status: checking...')
+        self.live_token_status = tk.StringVar(value='Live token: checking...')
+        self.live_storage = Path(__file__).resolve().parent / 'data'
 
         body = ttk.Frame(root, padding=22)
         body.pack(fill='both', expand=True)
@@ -2021,6 +2032,32 @@ class Launcher:
         path_row.pack(fill='x')
         ttk.Entry(path_row, textvariable=self.path).pack(side='left', fill='x', expand=True)
         ttk.Button(path_row, text='Browse...', command=self.browse).pack(side='left', padx=(8, 0))
+
+        services = ttk.LabelFrame(body, text='Carter service', padding=10)
+        services.pack(fill='x', pady=(18, 0))
+        services.columnconfigure(0, weight=1)
+        ttk.Label(services, textvariable=self.carter_status).grid(
+            row=0, column=0, sticky='w')
+        controls = ttk.Frame(services)
+        controls.grid(row=0, column=1, rowspan=2, sticky='e', padx=(12, 0))
+        self.carter_start_button = ttk.Button(
+            controls, text='Start Carter', command=lambda: self.run_carter_action('start'))
+        self.carter_start_button.pack(side='left')
+        self.carter_stop_button = ttk.Button(
+            controls, text='Stop', command=lambda: self.run_carter_action('stop'))
+        self.carter_stop_button.pack(side='left', padx=(6, 0))
+        self.carter_restart_button = ttk.Button(
+            controls, text='Restart', command=lambda: self.run_carter_action('restart'))
+        self.carter_restart_button.pack(side='left', padx=(6, 0))
+        ttk.Label(services, textvariable=self.live_token_status).grid(
+            row=1, column=0, sticky='w', pady=(6, 0))
+        self.live_token_button = ttk.Button(
+            services, text='Generate / verify live token', command=self.prepare_live_token)
+        self.live_token_button.grid(row=2, column=0, sticky='w', pady=(8, 0))
+        ttk.Label(
+            services,
+            text='The token value stays private on disk; only its fingerprint is displayed.',
+        ).grid(row=2, column=1, sticky='e', padx=(12, 0), pady=(8, 0))
 
         actions = ttk.Frame(body, padding=(0, 24, 0, 0))
         actions.pack(fill='both', expand=True)
@@ -2042,6 +2079,86 @@ class Launcher:
         fight_modules.grid(row=1, column=1, sticky='nsew', padx=6, pady=(6, 0))
         ttk.Label(body, text='View damage, healing, DPS/HPS, rank, and position, or export timeline CSV files.')\
             .pack(anchor='w', pady=(14, 0))
+        self.refresh_live_token_status()
+        self.poll_services()
+
+    def refresh_carter_status(self):
+        state = self.carter.status()
+        if state.state == 'running':
+            pid = f' (PID {state.pid})' if state.pid else ''
+            origin = f'; {state.detail}' if state.detail else ''
+            status = f'Carter status: running{pid}{origin}'
+        elif state.state == 'stopped':
+            status = 'Carter status: stopped'
+        else:
+            status = 'Carter status: unavailable'
+        if self.carter_notice:
+            status += f' — {self.carter_notice}'
+        self.carter_status.set(status)
+        if self.carter_busy:
+            start_state = stop_state = restart_state = 'disabled'
+        elif state.state == 'running':
+            start_state = 'disabled'
+            stop_state = restart_state = 'normal' if state.pid else 'disabled'
+        else:
+            start_state = 'normal' if state.state == 'stopped' else 'disabled'
+            stop_state = restart_state = 'disabled'
+        self.carter_start_button.configure(state=start_state)
+        self.carter_stop_button.configure(state=stop_state)
+        self.carter_restart_button.configure(state=restart_state)
+
+    def run_carter_action(self, action):
+        if self.carter_busy:
+            return
+        self.carter_busy = True
+        self.carter_notice = f'{action} requested...'
+        self.refresh_carter_status()
+
+        def work():
+            try:
+                result = getattr(self.carter, action)()
+                self.service_messages.put(('carter_result', result))
+            except Exception:
+                self.service_messages.put(('carter_error', None))
+
+        threading.Thread(target=work, name=f'carter-gui-{action}', daemon=True).start()
+
+    def refresh_live_token_status(self):
+        try:
+            info = live_access_token_info(self.live_storage)
+        except ValueError:
+            self.live_token_status.set('Live token: invalid or inaccessible')
+            return
+        if info is None:
+            self.live_token_status.set('Live token: not generated')
+        else:
+            self.live_token_status.set(
+                f"Live token: ready (fingerprint {info['fingerprint']})")
+
+    def prepare_live_token(self):
+        try:
+            info = ensure_live_access_token(self.live_storage)
+        except (OSError, ValueError):
+            self.live_token_status.set('Live token: generation failed')
+            return
+        verb = 'generated' if info['created'] else 'verified'
+        self.live_token_status.set(
+            f"Live token: {verb} (fingerprint {info['fingerprint']})")
+
+    def poll_services(self):
+        try:
+            while True:
+                message = self.service_messages.get_nowait()
+                self.carter_busy = False
+                if message[0] == 'carter_result':
+                    self.carter_notice = message[1].message
+                else:
+                    self.carter_notice = 'Carter control failed safely.'
+        except queue.Empty:
+            pass
+        self.refresh_carter_status()
+        if self.root.winfo_exists():
+            self.root.after(1000, self.poll_services)
 
     def browse(self):
         chosen = filedialog.askopenfilename(

@@ -107,6 +107,26 @@ cd ~/Carter/carter
 
 Do not start a second `main.py` process if Carter is already running. Carter should connect to Discord without joining a voice channel. Use `/logs health` to verify the loopback service from Discord.
 
+As an alternative to terminal 2, launch the desktop tools with:
+
+```bash
+.venv/bin/python log_backend/wow_log_gui.py
+```
+
+The **Carter service** panel can start, stop, or restart the Carter process. It
+uses the same single-instance lock as `main.py`, records only the process ID in
+that lock, refuses to signal an unverified process, and writes Carter output to
+the ignored private file `.carter_data/gui-carter.log`. The analysis service is
+still a separate process and must be started first. Stop first requests graceful
+cleanup; if Carter remains alive after 15 seconds, the controller terminates
+only the already verified Carter PID.
+
+The panel can also generate or verify the future live-log access token. Its raw
+value is stored only in `log_backend/data/live-analysis/.live-access-token` with
+owner-only permissions. The GUI and live status API show only a SHA-256
+fingerprint. The token is reserved for later authentication work and is not yet
+required by API requests.
+
 For a normal terminal run, press `Ctrl+C` once and allow cleanup to finish. If voice receive cleanup stalls, wait for the timeout before interrupting again.
 
 ## Discord setup and permissions
