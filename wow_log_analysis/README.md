@@ -266,11 +266,12 @@ requests continue to use compact metadata and sidecars.
 
 For several reports, choose **Cross-report timer learner** in the main GUI. The
 window lists the selected report caches with their local modification timestamps,
-newest first. Use **Add report files...** to select up to five existing
-`*.wcl.json` files; the picker only displays that supported cache type. Check the
-**Use** box for every report that should contribute pulls, or use **Select all**
-and **Select none**. The window remains idle until **Scan reports** is selected.
-After scanning, choose an encounter group and explicitly run **Learn merged
+newest first. Use **Add report files...** to add existing `*.wcl.json` files; the
+picker only displays that supported cache type. Check the **Use** box for up to
+five reports that should contribute pulls, or use **Select all** and **Select
+none**. The available-file list can contain more than five reports. The window
+remains idle until **Review checked reports** is selected. After scanning, choose
+an encounter group and explicitly run **Learn merged
 timer draft**. Each checked report is then interpreted in its own worker process,
 up to five workers, and
 the compact evidence is merged deterministically into one timer draft. If a
