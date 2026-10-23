@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/schemas/wow-guide-profile-v1.json",
+  "title": "WoW Guide Profile",
+  "type": "object",
+  "required": ["format", "schema_version", "profile_id", "title", "source", "encounter", "phases", "mechanics"],
+  "properties": {
+    "format": {"const": "wow-guide-profile/v1"},
+    "schema_version": {"const": 1},
+    "profile_id": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "required": ["kind", "title", "content_sha256"],
+      "properties": {
+        "kind": {"type": "string"},
+        "title": {"type": "string"},
+        "content_sha256": {"type": "string", "pattern": "^[A-Fa-f0-9]{64}$"},
+        "notes": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "encounter": {
+      "type": "object",
+      "required": ["name", "actors"],
+      "properties": {
+        "id": {"type": ["integer", "null"]},
+        "name": {"type": "string", "minLength": 1},
+        "aliases": {"type": "array", "items": {"type": "string"}},
+        "actors": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "timing_policy": {
+      "type": "object",
+      "properties": {
+        "encounter_schedule_source": {"const": "observed_logs_only"},
+        "effect_intervals_are_cast_intervals": {"const": false},
+        "guide_context_can_enable_timer": {"const": false},
+        "damage_values_included": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "order", "actors"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "order": {"type": "integer", "minimum": 1},
+          "actors": {"type": "array", "items": {"type": "string"}},
+          "guide_transition": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "mechanics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "actors", "phases", "difficulties", "categories", "severity", "timer_policy"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "name": {"type": "string", "minLength": 1},
+          "aliases": {"type": "array", "items": {"type": "string"}},
+          "actors": {"type": "array", "items": {"type": "string"}},
+          "phases": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "difficulties": {"type": "array", "minItems": 1, "items": {"enum": ["raid_finder", "normal", "heroic", "mythic"]}},
+          "categories": {"type": "array", "items": {"type": "string"}},
+          "severity": {"enum": ["low", "moderate", "high", "critical", "unknown"]},
+          "summary": {"type": "string"},
+          "facts": {
+            "type": "object",
+            "propertyNames": {
+              "not": {"enum": ["damage", "damage_amount", "damage_value", "amount"]}
+            }
+          },
+          "timer_policy": {
+            "type": "object",
+            "required": ["mode", "candidate", "reason"],
+            "properties": {
+              "mode": {"enum": ["observed_static", "conditional", "reactive", "phase", "never"]},
+              "candidate": {"type": "boolean"},
+              "reason": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["type", "target"],
+              "properties": {
+                "type": {"type": "string"},
+                "target": {"type": "string"},
+                "condition": {"type": "string"}
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -26,8 +26,9 @@ class FakeProvider:
 
     def __init__(self, connect_error=None):
         self.connect_error = connect_error
-        self.connects = self.closes = self.ends = 0
+        self.connects = self.closes = self.starts = self.ends = 0
         self.sent = []
+        self.tool_results = []
         self.events = asyncio.Queue()
 
     async def connect(self):
@@ -38,8 +39,14 @@ class FakeProvider:
     async def send_audio(self, pcm):
         self.sent.append(pcm)
 
+    async def start_audio(self):
+        self.starts += 1
+
     async def end_audio(self):
         self.ends += 1
+
+    async def send_tool_results(self, results):
+        self.tool_results.append(results)
 
     async def receive_audio(self):
         while True:
@@ -142,12 +149,28 @@ class VoiceSessionTests(unittest.IsolatedAsyncioTestCase):
         session.capture(42, b"wrong frame size")
         session.capture(42, MIC_FRAME)
         await eventually(lambda: len(provider.sent) == 1)
+        self.assertEqual(provider.starts, 1)
         self.assertEqual(len(provider.sent[0]), 640)
         self.assertAlmostEqual(session.input_seconds, 0.02)
         self.assertEqual(session.owner_id, 42)
+        self.assertEqual(session.rejected_speaker_frames, 1)
         with self.assertRaises(RuntimeError):
             await session.start(voice, 43)
         self.assertEqual(factory.names, ["gemini"])
+        await eventually(lambda: provider.ends == 1, timeout=1.2)
+
+    async def test_seed_audio_requires_explicit_matching_owner(self):
+        provider, voice = FakeProvider(), FakeVoice()
+        session, _ = self.make(provider)
+        voice.listening = True  # The shared wake receiver owns capture in this mode.
+        await session.start(voice, 42, self.notice, external_capture=True)
+        now = time.monotonic()
+        session.seed_audio([(now, MIC_FRAME)])
+        session.seed_audio([(now, MIC_FRAME)], source_user_id=43)
+        await REAL_SLEEP(0.03)
+        self.assertEqual(provider.sent, [])
+        session.seed_audio([(time.monotonic(), MIC_FRAME)], source_user_id=42)
+        await eventually(lambda: len(provider.sent) == 1)
 
     async def test_generated_audio_turn_and_usage_become_playable(self):
         provider = FakeProvider()
@@ -161,6 +184,59 @@ class VoiceSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(frame), PCMPlayback.FRAME)
         self.assertTrue(any(frame))
         self.assertAlmostEqual(session.output_seconds, 0.02)
+
+    async def test_tool_call_is_bounded_and_returned_to_same_provider(self):
+        provider = FakeProvider()
+        calls = []
+
+        async def handle(call):
+            calls.append(call)
+            return {"text": "Prepared evidence", "image_status": "available"}
+
+        factory = FakeFactory(provider)
+        session = VoiceSession(
+            SimpleNamespace(connect_timeout=0.1), SessionLimits(), factory,
+            tool_handler=handle,
+        )
+        self.sessions.append(session)
+        await session.start(FakeVoice(), 42)
+        provider.events.put_nowait(ProviderEvent("tool_call", tool_calls=({
+            "id": "call-1", "name": "query_raid_analysis",
+            "arguments": {"intent": "death"},
+        },)))
+        await eventually(lambda: bool(provider.tool_results))
+        self.assertEqual(calls[0]["arguments"], {"intent": "death"})
+        self.assertEqual(provider.tool_results[0][0]["id"], "call-1")
+        self.assertEqual(
+            provider.tool_results[0][0]["response"]["text"], "Prepared evidence",
+        )
+        self.assertEqual(session.tool_calls, 1)
+
+    async def test_extra_tool_calls_receive_bounded_errors(self):
+        provider = FakeProvider()
+        calls = []
+
+        async def handle(call):
+            calls.append(call)
+            return {"text": "ok"}
+
+        factory = FakeFactory(provider)
+        session = VoiceSession(
+            SimpleNamespace(connect_timeout=0.1), SessionLimits(), factory,
+            tool_handler=handle,
+        )
+        self.sessions.append(session)
+        await session.start(FakeVoice(), 42)
+        provider.events.put_nowait(ProviderEvent("tool_call", tool_calls=tuple(
+            {"id": f"call-{index}", "name": "query_raid_analysis", "arguments": {}}
+            for index in range(5)
+        )))
+        await eventually(lambda: bool(provider.tool_results))
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(provider.tool_results[0]), 5)
+        self.assertEqual(
+            provider.tool_results[0][-1]["response"], {"error": "tool_call_limit"},
+        )
 
     async def test_interruption_clears_pending_and_queued_output(self):
         for event_kind in ("interrupted", "speech_started"):

@@ -95,8 +95,9 @@ class FakeSession:
         if user_id == self.owner_id:
             self.captured.append((user_id, pcm))
 
-    def seed_audio(self, frames):
-        self.seeded.extend(frames)
+    def seed_audio(self, frames, *, source_user_id=None):
+        if source_user_id == self.owner_id:
+            self.seeded.extend(frames)
 
 
 class WakeListenerTests(unittest.IsolatedAsyncioTestCase):
@@ -181,6 +182,17 @@ class WakeListenerTests(unittest.IsolatedAsyncioTestCase):
         listener.capture(42, AFTER)
         listener.capture(43, OTHER)
         self.assertEqual(self.session.captured, [(42, AFTER)])
+        self.assertEqual(listener.dropped_non_owner_frames, 1)
+
+    async def test_active_session_never_routes_another_authorized_speaker(self):
+        listener = await self.make()
+        listener.capture(42, WAKE)
+        await eventually(lambda: listener.state == "conversation")
+        for _ in range(4):
+            listener.capture(43, OTHER)
+        listener.capture(42, AFTER)
+        self.assertEqual(self.session.captured, [(42, AFTER)])
+        self.assertEqual(listener.dropped_non_owner_frames, 4)
 
     async def test_reset_invalidates_detection_in_native_worker(self):
         self.detector.release = threading.Event()

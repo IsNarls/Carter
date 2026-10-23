@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:wow-fight-timer:v1",
+  "title": "WoW Fight Timer Export",
+  "type": "object",
+  "required": [
+    "format",
+    "schema_version",
+    "timer_id",
+    "status",
+    "enabled",
+    "encounter",
+    "clock",
+    "triggers",
+    "callouts",
+    "provenance"
+  ],
+  "properties": {
+    "format": {"const": "wow-fight-timer/v1"},
+    "schema_version": {"const": 1},
+    "exported_at": {"type": "string"},
+    "timer_id": {"type": "string", "minLength": 1},
+    "status": {"type": "string"},
+    "enabled": {"type": "boolean"},
+    "encounter": {
+      "type": "object",
+      "required": ["id", "name", "difficulty"],
+      "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+        "difficulty": {"type": ["integer", "string"]}
+      }
+    },
+    "clock": {
+      "type": "object",
+      "required": ["unit", "origin_event", "stop_event", "overdue_policy"],
+      "properties": {
+        "unit": {"const": "seconds"},
+        "origin_event": {"const": "ENCOUNTER_START"},
+        "stop_event": {"const": "ENCOUNTER_END"},
+        "overdue_policy": {"enum": ["EMIT_DUE_IN_ORDER"]}
+      }
+    },
+    "triggers": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"$ref": "#/$defs/trigger"},
+        "end": {"$ref": "#/$defs/trigger"}
+      }
+    },
+    "callouts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "offset_seconds", "kind", "message"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "offset_seconds": {"type": "number", "minimum": 0},
+          "kind": {"type": "string"},
+          "message": {"type": "string"},
+          "ability_id": {"type": "integer"},
+          "ability_ids": {"type": "array", "items": {"type": "integer"}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "provenance": {"type": "object"}
+  },
+  "$defs": {
+    "trigger": {
+      "type": "object",
+      "required": ["id", "event_type", "action", "match", "emit"],
+      "properties": {
+        "id": {"type": "string"},
+        "event_type": {"enum": ["ENCOUNTER_START", "ENCOUNTER_END"]},
+        "action": {"enum": ["START_TIMELINE", "END_TIMELINE"]},
+        "match": {
+          "type": "object",
+          "required": ["encounter_id", "difficulty"],
+          "properties": {
+            "encounter_id": {"type": "integer"},
+            "difficulty": {"type": ["integer", "string"]}
+          }
+        },
+        "emit": {
+          "type": "object",
+          "required": ["type", "message"],
+          "properties": {
+            "type": {"enum": ["FIGHT_ENGAGED", "FIGHT_ENDED"]},
+            "message": {"type": "string"}
+          }
+        },
+        "establishes_time_zero": {"type": "boolean"},
+        "cancel_pending_callouts": {"type": "boolean"},
+        "result_values": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

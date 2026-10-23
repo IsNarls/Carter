@@ -1,150 +1,219 @@
-# Carter Discord voice prototype
+# Carter
 
-Carter stays in the configured Discord voice channel and listens locally for
-an authorized user to say "Carter". It then sends that user's microphone audio
-to Gemini Live and plays generated speech in the channel.
-It runs independently of Armory-Bot-Development and does not import that bot.
+Carter is an independent Discord voice assistant with Warcraft Logs analysis. It keeps Discord, voice receive, wake-word handling, and Gemini/OpenAI sessions in the Carter process while a separate local analysis service owns Warcraft Logs downloads, storage, deterministic calculations, and image artifacts.
 
-## Setup (Python 3.11+ on Debian/Linux)
+Armory is not a dependency and must not be imported, installed, or modified for this deployment.
+
+## Architecture
+
+Run the two processes separately:
+
+1. `log_backend/analysis_api.py` listens on loopback and owns Warcraft Logs credentials and data.
+2. `main.py` connects to Discord and calls the analysis API at `http://127.0.0.1:8765/api/v1`.
+
+Keep the analysis API bound to `127.0.0.1`. Carter rejects an insecure remote analysis URL by default. Do not put Warcraft Logs credentials in Carter's root `.env`; they belong only in `log_backend/.env`.
+
+If a Windows log follower and the Debian bot must run on separate hosts, do not expose the backend's unauthenticated HTTP listener directly. Put it behind a private VPN or an authenticated TLS reverse proxy, restrict it with host firewalls, use an `https://.../api/v1` Carter URL, and leave `CARTER_ANALYSIS_ALLOW_INSECURE_REMOTE=false`. Loopback remains the recommended deployment.
+
+The selected voice and logs channels are persisted per Discord guild. Restoring a selection does **not** make Carter join voice on boot. A user must explicitly invoke a join/session command after every process start.
+
+## Debian prerequisites
+
+Carter requires Python 3.11 or newer. Voice and rendered analysis artifacts also need FFmpeg, Opus, and Cairo runtime libraries.
 
 ```bash
-cd /home/derek/Documents/Carter/carter
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg libopus0 libcairo2
+python3 --version
+```
+
+Create or repair the virtual environment from the repository root, then install the repository requirements:
+
+```bash
+cd ~/Carter/carter
 python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python setup_wakeword.py
+```
+
+If your checkout is elsewhere, use its actual path instead of `~/Carter/carter`.
+
+## Private configuration
+
+Create each private file only when it is absent. These commands do not overwrite an existing configuration:
+
+```bash
+test -e .env || install -m 600 .env.example .env
+test -e log_backend/.env || install -m 600 log_backend/.env.example log_backend/.env
+chmod 600 .env log_backend/.env
+```
+
+Never print, paste into logs, or commit either `.env` file.
+
+### Carter configuration
+
+Set Discord and provider values privately in the root `.env`. At minimum, configure:
+
+```dotenv
+CARTER_ENABLED=true
+CARTER_DISCORD_TOKEN=
+CARTER_ALLOWED_USER_IDS=
+CARTER_AI_PROVIDER=gemini
+CARTER_GEMINI_API_KEY=
+CARTER_GEMINI_MODEL=gemini-3.8-live
+CARTER_WAKE_WORD_ENABLED=true
+CARTER_WAKE_WORD=Carter
+CARTER_ALLOW_OPENAI_FALLBACK=false
+
+CARTER_AUTO_JOIN=false
+CARTER_ANALYSIS_ENABLED=true
+CARTER_ANALYSIS_API_URL=http://127.0.0.1:8765/api/v1
+CARTER_ANALYSIS_TIMEOUT=15
+CARTER_ANALYSIS_ALLOW_INSECURE_REMOTE=false
+CARTER_ANALYSIS_LOG_CHANNEL_INGEST=true
+```
+
+Slash commands are registered globally for every server that has installed Carter, and Discord may take time to propagate a new global command set. `CARTER_DISCORD_GUILD_ID` is optional and now serves only to clear stale commands that an older Carter version registered directly in that one guild.
+
+Keep `CARTER_AUTO_JOIN=false`: a saved channel is a selection, not permission to connect automatically. Keep `CARTER_ALLOW_OPENAI_FALLBACK=false` unless OpenAI fallback is explicitly wanted and configured.
+
+### Analysis service configuration
+
+Put only the Warcraft Logs OAuth client credentials in `log_backend/.env`:
+
+```dotenv
+WARCRAFT_LOGS_CLIENT_ID=
+WARCRAFT_LOGS_CLIENT_SECRET=
+```
+
+The backend importer reads those values from its process environment or `log_backend/.env`. The Carter process does not need them and the root `.env.example` intentionally does not define them.
+
+## Start Carter
+
+Start the analysis service first, from terminal 1:
+
+```bash
+cd ~/Carter/carter/log_backend
+../.venv/bin/python analysis_api.py --storage ./data --host 127.0.0.1 --port 8765
+```
+
+Then start Carter from terminal 2:
+
+```bash
+cd ~/Carter/carter
 .venv/bin/python main.py
 ```
 
-Configure your private `.env` using `.env.example` as the shareable reference.
-Set `CARTER_ENABLED=true`, Carter's dedicated Discord token, guild and voice channel
-IDs, comma-separated `CARTER_ALLOWED_USER_IDS`, and `CARTER_GEMINI_API_KEY`.
-Set `CARTER_AI_PROVIDER=gemini` and choose a Gemini Live model available to your
-API key; the template uses `gemini-3.8-live`. The model name and key must both be
-valid for activation to work. Environment variables override `.env`.
-Never paste tokens into chat or commit `.env`.
+Do not start a second `main.py` process if Carter is already running. Carter should connect to Discord without joining a voice channel. Use `/logs health` to verify the loopback service from Discord.
 
-Wake listening is enabled by default and needs no additional API key. The setup
-script downloads the 40 MB `vosk-model-small-en-us-0.15` model once from Vosk's
-official server. [Vosk estimates about 300 MB runtime memory for small models](https://alphacephei.com/vosk/models).
-Repeat setup on each deployment machine; the bot does not download models at runtime.
-The default `CARTER_WAKE_MODEL_PATH=models/vosk-model-small-en-us-0.15` is relative
-to Carter's directory. A missing model is reported by `/carter status`; manual
-`/carter activate` remains available.
+For a normal terminal run, press `Ctrl+C` once and allow cleanup to finish. If voice receive cleanup stalls, wait for the timeout before interrupting again.
 
-If Carter is already running, stop that process with Ctrl+C, install dependencies,
-and restart it to load these changes. Do not launch a second instance.
+## Discord setup and permissions
 
-Create a separate bot in the Discord Developer Portal and invite it using the
-`bot` and `applications.commands` scopes. Grant View Channel, Connect, and Speak
-in the configured channel. No Message Content or Members privileged intent is needed.
-Enable Developer Mode in Discord to copy guild/channel/user IDs.
+The Discord application needs the `bot` and `applications.commands` scopes. Grant only the permissions Carter uses, including viewing channels, sending messages, reading message history, connecting, speaking, and using voice activity.
 
-## Use
+Enable the privileged **Message Content Intent** when selected log channels contain report URLs in message text or forwarded/embed snapshots. Carter also needs `View Channel` and `Read Message History` in the selected logs channel.
 
-Only users in `CARTER_ALLOWED_USER_IDS` can run the guild's Carter commands.
+Only IDs in `CARTER_ALLOWED_USER_IDS` may configure, activate, or control Carter. Keep that list explicit and test unauthorized access before deployment.
 
-| Command | Behavior |
-| --- | --- |
-| `/carter join` | Join or retry the configured channel and arm local wake listening. You must be in that channel. |
-| `/carter activate` | Start one AI session for your microphone. You must be in that channel. |
-| `/carter stop` | Close AI and return to local wake listening while remaining in voice. |
-| `/carter leave` | Stop AI and wake listening, then disconnect from voice. |
-| `/carter status` | Show connection, wake state, AI state, provider, and usage without secrets. |
+## Commands
 
-With `CARTER_AUTO_JOIN=true` (default), Carter joins on startup. Join the channel,
-say "Carter", pause briefly, then ask your question. The `armed` wake state means
-the local listener is ready and AI is inactive. Only `CARTER_ALLOWED_USER_IDS`
-can wake Carter; bots and unauthorized users are ignored. Waiting for the name
-uses local Vosk recognition and sends no audio to Gemini or OpenAI.
+### `/carter`
 
-One conversation may be active at a time. Only its initiating user's microphone
-feeds AI, while everyone in the channel can hear replies. The name does not
-start another session during an active conversation. When the session ends,
-Carter remains in voice and returns to listening for its name; each wake starts
-a new conversation. `/carter activate` remains a manual alternative.
+- `/carter setvoice` stores this guild's selected voice channel without requiring the caller to be in voice.
+- `/carter setlogs` stores this guild's selected logs channel and enables that channel as the source of report links.
+- `/carter join` joins the saved voice channel and arms local wake listening.
+- `/carter voicechannel` is the convenience command that accepts both channels, saves them, and connects; the caller must already be in the selected voice channel.
+- `/carter status` reports connection, selected channels, session state, and whether the wake listener is armed.
+- `/carter activate` explicitly starts an authorized conversation.
+- `/carter stop` ends the AI conversation while Carter remains in voice and rearms wake listening.
+- `/carter leave` ends the session and disconnects from voice.
+- `/carter ask` sends a text question and returns the answer in Discord chat.
 
-The listener keeps up to one second of recent audio and five seconds while AI
-connects, in memory only. A slow connection can clip the start of a long question.
-There is a three-second cooldown after a conversation or `/carter stop`, and a
-30-second cooldown after failed activation. Local speech recognition may miss
-the name or falsely recognize it, especially with accents or background noise.
-Set `CARTER_WAKE_WORD_ENABLED=false` for manual-only activation, or
-`CARTER_AUTO_JOIN=false` to require `/carter join` after startup.
+Selections are isolated by guild and survive Carter restarts. Carter still remains disconnected until `/carter join` or the supported voice-session command is invoked.
 
-Carter joins with self-deafening disabled so it can receive audio.
-Use headphones: bot accounts are filtered, but loudspeaker audio picked up by
-your own microphone can still produce acoustic echo. Speak during Carter's reply
-to interrupt it; provider interruption events clear queued playback.
+### `/logs`
 
-## Providers and usage limits
+- `/logs health` checks Carter's connection to the local analysis service.
+- `/logs reports` and `/logs fights` browse imported reports and encounters.
+- `/logs select` stores the guild's current report/fight context.
+- `/logs source` selects stored analysis or the current/an explicitly numbered archived live attempt.
+- `/logs summary` returns a deterministic encounter summary.
+- `/logs ranking` returns calculated DPS or HPS rankings.
+- `/logs player` returns one player's data for the selected fight or pull.
+- `/logs death` explains one selected player's death and attaches its matching position diagram when available.
+- `/logs deaths` lists the selected pull's deaths in fight-relative timestamp order.
+- `/logs identity` maps the invoking Discord user to a character name for “Why did I die?” requests.
+- `/logs import` starts a report import or refresh job.
+- `/logs job` reports the status and outcome of an import job.
 
-Gemini is the primary provider. OpenAI Realtime fallback requires all of:
-`CARTER_ALLOW_OPENAI_FALLBACK=true`, a valid `CARTER_OPENAI_API_KEY`, and access to
-`CARTER_OPENAI_MODEL` (template: `gpt-realtime-2.1`). A Gemini quota or rate-limit
-failure can trigger this fallback; invalid credentials, invalid models, and
-unrelated errors do not. Carter reports a provider switch and starts fresh
-conversation context. Fallback remains off by default.
+Discord option descriptions are the source of truth for each command's required filters. Use `/logs reports` and `/logs fights` before selecting when a report, boss, difficulty, or player name is ambiguous.
 
-The default inactivity timeout is 45 seconds (`CARTER_SESSION_TIMEOUT`, 5–300).
-The absolute session limit is 180 seconds (`CARTER_MAX_SESSION_SECONDS`, 10–900),
-including continuous speech. Both close the AI session while leaving voice
-connected. Local activity detection uses `CARTER_INPUT_RMS_THRESHOLD=300`
-(0–32767); increase it if quiet noise keeps the session alive or reduce it if
-speech does not reset the timer. This only controls the inactivity timer: all
-activating-user audio received during an active session goes to the provider.
-The activity timer is separate from local wake-name recognition.
-Audio queues are bounded, and provider recovery allows at most one transient
-retry instead of an unlimited reconnect loop.
+## Report ingestion and import jobs
 
-Usage includes the audio sent and generated, plus any provider context charges.
-Audio duration and provider-reported counts are estimates, not a dollar balance.
-Gemini free quota is not guaranteed; check your project's limits and billing.
-OpenAI fallback can incur charges when enabled and triggered. Session time limits
-bound each activation's duration; they are not a dollar spending cap.
+When `CARTER_ANALYSIS_LOG_CHANNEL_INGEST=true`, Carter scans messages from the guild's selected logs channel for `warcraftlogs.com/reports/...` URLs, including supported embed and forwarded-message content. It submits discovered report codes to the local service rather than downloading Warcraft Logs data itself.
 
-The process serializes voice changes and releases sessions and connections on
-shutdown (Ctrl+C). A local file lock prevents duplicate processes from this
-directory; deploy one instance only, since the lock does not coordinate separate
-machines or copied directories. Logs go to the Carter process's stderr without
-API keys, tokens, or raw audio. There is no audio archive, tool execution,
-website integration, or persistent conversation history.
+Imports are jobs because a complete report can require several API requests. `/logs import` acknowledges the request, and `/logs job` exposes progress or a safe error. Importing the same report again refreshes its stored fights so a live raid log can gain new pulls without creating a separate logical report. Backend storage under `log_backend/data` persists across Carter restarts; do not commit or expose that runtime directory.
 
-## Verification
+Warcraft Logs rate limits, an incomplete live upload, or missing table coverage can leave a job partial. Carter must report that state instead of treating missing rows as zero.
 
-Run the offline checks from this directory:
+## Deterministic analysis semantics
+
+Raid-log calculations are performed by the analysis service, not invented by Gemini:
+
+- DPS is qualifying boss damage divided by the selected encounter duration.
+- HPS is qualifying effective player healing divided by the selected encounter duration.
+- A DPS ranking is ordered by DPS, not by raw damage done. Raw totals can be shown as supporting data.
+- Pet contribution is attributed to its known player owner; NPCs are not ranked as players. Missing or partial source coverage is distinct from a real zero.
+- Character identity is guild scoped and uses stable source identity where available. `/logs identity` is used when a name is ambiguous.
+
+`/carter ask` resolves supported log questions through the deterministic backend and grounds the English response in the returned result. It must say when a query cannot be resolved; it must not estimate a ranking, death, fight, or timestamp. This path is suitable for chat even when no voice session is active.
+
+During an authorized voice conversation, Gemini Live can call the same analysis operations as tools. The model handles natural-language intent and wording, while the backend selects stored data and performs calculations. Tool output remains guild scoped. Local wake listening does not open a Gemini conversation or consume Gemini usage until the wake word is detected or `/carter activate` is used.
+
+## Death timelines and images
+
+`/logs deaths` returns recorded deaths in chronological order. Fight-relative timestamps identify when each death happened; stored-report answers include the report/fight Warcraft Logs URL. `/logs death` resolves one player and death number, then calls the backend's combined answer endpoint once for its text, evidence, replay, and image.
+
+For a supported death question, the analysis service may also return a schematic position diagram at the death timestamp. Carter converts the matching SVG to PNG and attaches it with the explanation. It is recorded-position evidence, not arena artwork. If usable position data is unavailable, Carter still returns the deterministic explanation and reports why the image is absent; it does not fabricate a frame.
+
+## Offline verification
+
+These checks do not contact Discord, Gemini, OpenAI, or Warcraft Logs:
 
 ```bash
-.venv/bin/python -m compileall -q main.py wake_listener.py wakeword.py setup_wakeword.py
+.venv/bin/python -m compileall -q main.py session.py providers.py audio.py discord_receive.py wakeword.py wake_listener.py setup_wakeword.py log_backend
 .venv/bin/python -m unittest discover -p 'test_*.py'
+.venv/bin/python -m unittest discover -s log_backend -p 'test_*.py'
 ```
 
-Offline tests use fake providers and do not spend API quota. They cannot establish
-Discord microphone reception, model access, encryption compatibility, or audible
-playback. Those require the real bot, guild, allowed speaker, Gemini key/model,
-and working microphone. OpenAI credentials are needed only for enabled fallback.
+Do not expose secrets in test output. Tests should use temporary backend storage, never `log_backend/data` from a live deployment.
 
-Live smoke check:
+## Live verification checklist
 
-1. Start Carter and confirm automatic voice join and `/carter status` showing
-   wake listener `armed` with AI inactive. Use `/carter join` if joining fails.
-2. Speak without the name; AI must remain inactive and no provider session starts.
-3. Say "Carter", pause briefly, ask a question, and confirm audible Gemini output.
-4. Confirm unauthorized users cannot wake Carter or control commands, and another
-   user's audio does not feed the active conversation.
-5. Run `/carter stop`; confirm AI ends, voice remains connected, and the listener
-   returns to `armed`. Wait three seconds, then wake it again. Also check that
-   inactivity and absolute time limits return it to local wake listening.
-6. Check `/carter activate` as a manual alternative. Run `/carter leave` to confirm
-   voice and wake listening stop; use `/carter join` to restore them.
-7. Stop/restart Carter to check cleanup and automatic joining. Confirm Armory
-   remains online independently.
+Live Discord, provider, and Warcraft Logs checks were **not performed as part of this documentation update**. Before treating the deployment as complete, verify all of the following in a test guild:
 
-Live wake accuracy, Discord voice, and provider calls have not been validated by
-offline checks. Discord voice reception depends on the pinned receive extension and its
-compatibility with Discord's voice encryption.
+- The backend starts on `127.0.0.1:8765`, `/logs health` succeeds, and it is not reachable from another host.
+- Carter starts once, registers commands, and does not autojoin voice.
+- `/carter setvoice` and `/carter setlogs` save different guilds' selections independently; a Carter restart restores the selections but remains disconnected.
+- `/logs import` accepts a known report, `/logs job` reaches a successful or explicitly partial terminal state, and re-importing a live report adds new fights.
+- `/logs reports`, `/logs fights`, `/logs source`, and `/logs summary` resolve the intended source and selected fight.
+- `/logs ranking` reports top DPS for the selected encounter rather than sorting by raw damage; HPS uses the selected encounter duration.
+- `/logs deaths` returns an ordered last-wipe timeline, and `/logs death` attaches a matching timestamped position diagram when the report supports one.
+- `/carter ask` answers a supported raid-log question in English with deterministic stored data and declines unsupported/ambiguous requests safely.
+- `/carter join` joins the saved channel and `/carter status` reports the wake listener armed.
+- Ordinary speech without “Carter” does not start a Gemini conversation or trigger analysis tools.
+- Saying “Carter” starts one authorized Gemini Live conversation, and a log question invokes the local analysis tool successfully.
+- `/carter stop` ends AI activity, leaves Carter connected, and rearms wake listening; `/carter leave` disconnects.
+- A user not listed in `CARTER_ALLOWED_USER_IDS` cannot configure, activate, query, or control Carter.
 
-Official references: [Gemini Live SDK guide](https://ai.google.dev/gemini-api/docs/live-api/get-started-sdk),
-[Gemini Live capabilities](https://ai.google.dev/gemini-api/docs/live-api/capabilities),
-[OpenAI Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations),
-[Discord receive extension](https://github.com/imayhaveborkedit/discord-ext-voice-recv),
-and [discord.py interactions](https://discordpy.readthedocs.io/en/stable/interactions/api.html).
+Do not create, install, or enable a systemd service until this live checklist succeeds. After it succeeds, service units can be prepared for review, but they should not be enabled automatically.
+
+## Security notes
+
+- Never commit `.env`, `log_backend/.env`, tokens, API keys, OAuth secrets, or backend runtime data.
+- Keep the analysis API on loopback and keep `CARTER_ANALYSIS_ALLOW_INSECURE_REMOTE=false`.
+- Keep `CARTER_ALLOW_OPENAI_FALLBACK=false` unless fallback was explicitly approved.
+- Rotate any credential that has appeared in a terminal transcript, chat, issue, or commit.
+- Safe diagnostics include dependency status, test outcomes, process state, job state, and missing variable names—never secret values.

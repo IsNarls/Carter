@@ -40,6 +40,7 @@ class WakeListener:
         self.silence_flushed = set()
         self.reset_requested = False
         self.receive_fault = None
+        self.dropped_non_owner_frames = 0
 
     @property
     def state(self):
@@ -83,7 +84,14 @@ class WakeListener:
                 if user_id == self.pending_owner:
                     self.pending.append((now, pcm))
             elif self.session.active:
-                self.session.capture(user_id, pcm)
+                # The shared Discord receiver listens for every authorized user
+                # so any one of them can wake Carter while it is armed. Once a
+                # conversation starts, ownership is exclusive: another
+                # authorized speaker must never feed or interrupt that session.
+                if user_id == self.session.owner_id:
+                    self.session.capture(user_id, pcm)
+                else:
+                    self.dropped_non_owner_frames += 1
             elif now >= self.cooldown_until:
                 try:
                     self.input.put_nowait((self.generation, now, user_id, pcm))
@@ -197,7 +205,7 @@ class WakeListener:
                     success = success and self.session.active and self.session.owner_id == user_id
                     if success:
                         with self.guard:
-                            self.session.seed_audio(self.pending)
+                            self.session.seed_audio(self.pending, source_user_id=user_id)
                             self.pending.clear()
                             self.pending_owner = None
                         was_active = True
