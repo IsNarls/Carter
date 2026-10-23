@@ -61,7 +61,8 @@
           "message": {"type": "string"},
           "ability_id": {"type": "integer"},
           "ability_ids": {"type": "array", "items": {"type": "integer"}}
-        }
+        },
+        "additionalProperties": false
       }
     },
     "provenance": {"type": "object"}

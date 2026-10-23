@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from combat_log_viewer import Viewer
 from encounter_parser import (analyze_encounter, scan_encounters, write_boss_position_csv,
                               write_csv, write_player_csv, Position, WOW_CLASS_COLORS)
+from guide_profile import load_guide_profile
 from mechanic_timer_learner import learn_timer_script, save_draft
 from timer_export import TIMER_EXPORT_FORMAT, build_timer_export, save_timer_export
 from warcraft_logs_importer import (WarcraftLogsClient, download_report_batch,
@@ -1374,6 +1375,14 @@ class MechanicDraftReviewWindow:
         if source_ids:
             ttk.Label(header, text=f'Source fights: {source_ids}', wraplength=1170).pack(
                 anchor='w', pady=(3, 0))
+        guide_context = result.get('guide_context') or {}
+        if guide_context:
+            ttk.Label(
+                header,
+                text=(f"Guide context: {guide_context.get('title', guide_context['profile_id'])}  |  "
+                      f"{guide_context.get('matched_candidate_count', 0)} log abilities matched"),
+                wraplength=1170,
+            ).pack(anchor='w', pady=(3, 0))
         ttk.Label(
             header,
             text='Review required. This draft is saved with enabled=false and is not used for callouts.',
@@ -1431,10 +1440,11 @@ class MechanicDraftReviewWindow:
         return table
 
     def _accepted_table(self, parent):
-        columns = ('ability', 'confidence', 'pulls', 'coverage', 'targets', 'health',
+        columns = ('ability', 'guide', 'confidence', 'pulls', 'coverage', 'targets', 'health',
                    'first', 'repeat')
         settings = {
-            'ability': ('Ability', 210, 'w'), 'confidence': ('Confidence', 85, 'center'),
+            'ability': ('Ability', 180, 'w'), 'guide': ('Guide context', 170, 'w'),
+            'confidence': ('Confidence', 85, 'center'),
             'pulls': ('Observed pulls', 105, 'center'), 'coverage': ('Coverage', 80, 'center'),
             'targets': ('Raid hit', 75, 'center'), 'health': ('Median health', 100, 'center'),
             'first': ('First occurrence', 150, 'center'),
@@ -1444,7 +1454,8 @@ class MechanicDraftReviewWindow:
         for candidate in self.result['accepted_abilities']:
             evidence = candidate['evidence']
             table.insert('', 'end', values=(
-                candidate['ability'], candidate.get('confidence', '-'),
+                candidate['ability'], self._guide_summary(candidate),
+                candidate.get('confidence', '-'),
                 f"{evidence.get('observed_pulls', 0)}/{evidence.get('selected_pulls', 0)}",
                 self._percent(evidence.get('pull_coverage')),
                 self._percent(evidence.get('median_target_fraction')),
@@ -1454,9 +1465,10 @@ class MechanicDraftReviewWindow:
             ))
 
     def _rejected_table(self, parent):
-        columns = ('ability', 'reasons', 'pulls', 'coverage', 'targets', 'health', 'first')
+        columns = ('ability', 'guide', 'reasons', 'pulls', 'coverage', 'targets', 'health', 'first')
         settings = {
-            'ability': ('Ability', 200, 'w'), 'reasons': ('Rejection reasons', 390, 'w'),
+            'ability': ('Ability', 170, 'w'), 'guide': ('Guide context', 160, 'w'),
+            'reasons': ('Rejection reasons', 300, 'w'),
             'pulls': ('Observed pulls', 100, 'center'), 'coverage': ('Coverage', 75, 'center'),
             'targets': ('Raid hit', 75, 'center'), 'health': ('Median health', 100, 'center'),
             'first': ('First occurrence', 155, 'center'),
@@ -1466,13 +1478,24 @@ class MechanicDraftReviewWindow:
             evidence = candidate.get('evidence') or {}
             reasons = ', '.join(reason.replace('_', ' ') for reason in candidate.get('reasons', []))
             table.insert('', 'end', values=(
-                candidate['ability'], reasons or 'No accepted prediction',
+                candidate['ability'], self._guide_summary(candidate),
+                reasons or 'No accepted prediction',
                 f"{evidence.get('observed_pulls', 0)}/{evidence.get('selected_pulls', self.result['pull_count'])}",
                 self._percent(evidence.get('pull_coverage')),
                 self._percent(evidence.get('median_target_fraction')),
                 self._percent(evidence.get('median_target_health_fraction')),
                 self._timing(evidence.get('first_occurrence')),
             ))
+
+    @staticmethod
+    def _guide_summary(candidate):
+        context = candidate.get('guide_context') or {}
+        if not context:
+            return '-'
+        categories = ', '.join(context.get('categories') or [])
+        mode = (context.get('timer_policy') or {}).get('mode', 'context')
+        severity = context.get('severity') or 'unknown'
+        return f'{severity} / {mode}' + (f' / {categories}' if categories else '')
 
     def _schedule_table(self, parent):
         columns = ('time', 'kind', 'ability', 'message')
@@ -1570,6 +1593,17 @@ class CrossReportLearnerWindow:
         self.messages = queue.SimpleQueue()
         self.busy = False
         self.status = tk.StringVar()
+        available_guides = sorted((Path(__file__).parent / 'guide_profiles').glob('*.guide.json'))
+        default_guide = available_guides[0] if len(available_guides) == 1 else None
+        self.guide_profile_path = tk.StringVar(value=str(default_guide or ''))
+        self.guide_profile_name = tk.StringVar(value='No guide context selected.')
+        if default_guide is not None:
+            try:
+                profile = load_guide_profile(default_guide)
+                self.guide_profile_name.set(f"Guide: {profile['title']}")
+            except ValueError as error:
+                self.guide_profile_path.set('')
+                self.guide_profile_name.set(f'Guide profile error: {error}')
 
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill='x')
@@ -1580,6 +1614,17 @@ class CrossReportLearnerWindow:
                  'Reports are shown newest first. Review the checked reports, select an '
                  'encounter group, and run the learner.',
         ).pack(anchor='w', pady=(4, 0))
+        guide_row = ttk.Frame(header)
+        guide_row.pack(fill='x', pady=(8, 0))
+        ttk.Label(guide_row, textvariable=self.guide_profile_name).pack(
+            side='left', fill='x', expand=True)
+        self.clear_guide_button = ttk.Button(
+            guide_row, text='Clear guide', command=self.clear_guide_profile,
+            state='normal' if default_guide else 'disabled')
+        self.clear_guide_button.pack(side='right')
+        self.guide_button = ttk.Button(
+            guide_row, text='Choose guide profile...', command=self.choose_guide_profile)
+        self.guide_button.pack(side='right', padx=(0, 8))
 
         reports = ttk.LabelFrame(self.root, text='Available report caches', padding=8)
         reports.pack(fill='x', padx=12, pady=(0, 10))
@@ -1663,6 +1708,33 @@ class CrossReportLearnerWindow:
         self.learn_button.pack(side='right')
         self.refresh_report_table()
         self.root.after(100, self.poll)
+
+    def choose_guide_profile(self):
+        if self.busy:
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title='Select timed-mechanic guide profile',
+            initialdir=str(Path(__file__).parent / 'guide_profiles'),
+            filetypes=[('WoW guide profiles', '*.guide.json')],
+        )
+        if not selected:
+            return
+        try:
+            profile = load_guide_profile(selected)
+        except ValueError as error:
+            messagebox.showerror('Invalid guide profile', str(error), parent=self.root)
+            return
+        self.guide_profile_path.set(selected)
+        self.guide_profile_name.set(f"Guide: {profile['title']}")
+        self.clear_guide_button.configure(state='normal')
+
+    def clear_guide_profile(self):
+        if self.busy:
+            return
+        self.guide_profile_path.set('')
+        self.guide_profile_name.set('No guide context selected.')
+        self.clear_guide_button.configure(state='disabled')
 
     def refresh_report_table(self):
         self.paths = selectable_report_paths(self.paths)
@@ -1808,6 +1880,9 @@ class CrossReportLearnerWindow:
             state='normal' if enabled and self.checked_report_paths() else 'disabled')
         self.remove_report_button.configure(
             state='normal' if enabled and self.report_table.selection() else 'disabled')
+        self.guide_button.configure(state='normal' if enabled else 'disabled')
+        self.clear_guide_button.configure(
+            state='normal' if enabled and self.guide_profile_path.get() else 'disabled')
 
     def start_scan(self):
         selected_paths = self.checked_report_paths()
@@ -1863,12 +1938,14 @@ class CrossReportLearnerWindow:
         if group is None or len(group['pulls']) < 3:
             return
         self.set_busy(True, f"Interpreting {len(group['paths'])} reports for {group['name']}...")
+        guide_profile = self.guide_profile_path.get().strip() or None
 
         def work():
             try:
                 result = learn_timer_script(
                     group['paths'], group['encounter_id'], group['difficulty'],
-                    progress=lambda text: self.messages.put(('progress', text)))
+                    progress=lambda text: self.messages.put(('progress', text)),
+                    guide_profile=guide_profile)
                 destination = (Path(__file__).parent / 'mechanic-drafts' /
                                f"{result['draft_id']}.json")
                 save_draft(result, destination)
