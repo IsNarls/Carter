@@ -1,10 +1,12 @@
-# Log analysis API: voice and Discord integration review
+# Log retrieval and analysis API: voice and Discord integration review
 
 Prepared: October 23, 2026. This document describes the current repository implementation and proposed integration work. Endpoint paths were checked against `analysis_api.py`; it does not establish that a server is currently running.
 
 Repository context: GitHub `IsNarls/Carter` already has a Discord voice prototype on `main` (observed commit `eeb2e54`), including wake-word listening, Gemini Live sessions, and optional OpenAI fallback. The status descriptions below concern the log-analysis workspace on `log-analysis-api`; they do not mean the existing prototype lacks voice transport. The two branches currently have unrelated histories. Integrate the analysis service into the existing Carter bot deliberately; do not replace `main` or blindly merge the histories. Review `main.py`, `providers.py`, `session.py`, `discord_receive.py`, and the main-branch README before adding an adapter.
 
 ## Intended outcome
+
+This codebase handles both log retrieval and log analysis. It retrieves Warcraft Logs reports and their event data, ingests local combat logs, analyzes encounters, persists the results, and exposes analysis and answer payloads. The voice/Discord integration should reuse this backend for that entire pipeline rather than implement a separate retrieval or analysis system.
 
 A user can ask a question by voice or Discord text, such as "Why did Alex die on the last pull?" The integration resolves the encounter, player, and death, retrieves a combined answer payload, and presents the explanation with its supporting map image. Voice receives a concise spoken explanation; Discord receives text and an image attachment from the same evidence.
 
@@ -14,6 +16,8 @@ Generate the visual alongside the answer evidence so the transport layer receive
 
 | Capability | Current state |
 |---|---|
+| Warcraft Logs report/event retrieval and local caches | Implemented in `warcraft_logs_importer.py`; available through Python/GUI workflows |
+| Retrieval/import and analysis preparation over HTTP | Not implemented; current HTTP routes query existing analysis |
 | Stored report metadata and persisted fight analysis queries | Implemented |
 | Local combat-log following and live analysis snapshots | Implemented; requires startup configuration |
 | Player performance, rankings, mechanics, and death evidence | Implemented |
@@ -35,7 +39,7 @@ Generate the visual alongside the answer evidence so the transport layer receive
 | `analysis_service.py` | Stored/live queries, limits, errors, combined death-answer assembly |
 | `death_answer.py` | Evidence-based death summary and SVG position diagram |
 | `encounter_parser.py` | Encounter analysis, death correlation, positions, persisted analysis |
-| `warcraft_logs_importer.py` | Warcraft Logs import and metadata handling |
+| `warcraft_logs_importer.py` | Warcraft Logs authentication, report/event retrieval, paginated downloads, local caches, and metadata handling |
 | `live_log_service.py` | Local log ingestion, snapshots, cursors, completed/archived attempts |
 | `mechanic_timeline.py` | Scheduled mechanic events and timer-module behavior |
 | `wow_log_gui.py` | Desktop analysis and interactive map; not required by the HTTP renderer |
@@ -66,6 +70,12 @@ By default, live following begins at the end of the log. Stored fight queries re
 The bot can use loopback when it runs on the API machine. A remotely hosted bot needs a deliberately configured connection to that machine. Define access control and transport protection before exposing this unauthenticated API remotely.
 
 All current successful HTTP responses are JSON, including images embedded inside JSON. Python callers can use `AnalysisService` directly instead of HTTP.
+
+### Retrieval and analysis ownership
+
+The existing retrieval path uses `WarcraftLogsClient.download_report(...)` and batch retrieval helpers in `warcraft_logs_importer.py`. The GUI accepts report URLs and coordinates downloading and analysis; `encounter_parser.py` provides encounter scanning and analysis. Local live logs are ingested through `LiveLogService`. These are existing backend capabilities, not work to recreate in the bot.
+
+Distinguish backend functionality from the current HTTP surface: there is no report-download/import or analysis-start endpoint today. `/reports` discovers already stored reports; fight queries read persisted analyses and can return `ANALYSIS_REQUIRED`. For a bot command such as "Analyze this Warcraft Logs URL," expose a controlled service/job wrapper around the existing retrieval and analysis functions, report progress/completion/errors, and then use the current query endpoints. Keep retrieval credentials and managed cache destinations on the backend. Review existing cache retention before promising that a previously imported report will remain available indefinitely.
 
 ## Implemented endpoint inventory
 
@@ -235,6 +245,7 @@ This section is proposed integration work, not implemented endpoints.
 
 1. Receive Discord text or a voice transcript.
 2. Resolve the requested source, report/fight or live session/attempt, player, and death. Persist a Discord-user-to-character mapping for questions such as "Why did I die?"
+   When the user supplies a report URL that is not prepared, use the existing backend retrieval and analysis pipeline through a new adapter/job interface before querying it. This interface is proposed work; no such HTTP route currently exists.
 3. If multiple candidates remain, ask a focused follow-up. Do not silently choose a different pull or similarly named player.
 4. Fetch the combined `/answer` payload once. Use its encounter identity and evidence for both output channels.
 5. Use `answer.text` directly for a deterministic baseline, or build a richer explanation from `analysis` while retaining uncertainty. Add speech-specific phrasing in the adapter; there is no `speech_text` field currently.
@@ -249,6 +260,7 @@ For proactive notifications, poll `/live/updates` using cursors, deduplicate by 
 Review the current code before implementing the adapters. Do not assume this document creates routes or transport capabilities.
 
 - Verify every documented route and response field against `analysis_api.py`, `analysis_service.py`, and tests.
+- Preserve this codebase's ownership of log retrieval and analysis. Reuse the existing importer, local follower, parser, persistence, and query services. Add retrieval/analysis job endpoints or direct service orchestration only where the Discord/voice workflow needs them, with progress, bounded concurrency, failure recovery, and tests; do not duplicate these systems in the bot.
 - Review death correlation and spatial evidence in `encounter_parser.py`, including missing coordinates, stale samples, floor changes, post-death events, and coordinate scale.
 - Review SVG bounds, overlapping labels, actor identity/class presentation, stale victim positions, and image accessibility. Determine whether PNG rendering belongs in the API or the bot adapter.
 - Define a typed shared answer contract for text, voice, visual availability, evidence references, confidence, and source/session/attempt identity. Version additions deliberately.
