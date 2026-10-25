@@ -1,14 +1,20 @@
+import io
 import json
 import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 
 if __package__:
     from .encounter_parser import EncounterRef
-    from .wow_log_gui import (fight_module_catalog, filter_checked_report_paths,
+    from .wow_log_gui import (LivePipelineAPIError, fight_module_catalog,
+                              filter_checked_report_paths,
+                              fetch_live_pipeline_snapshot,
                               group_cross_report_encounters, guild_data_directory,
+                              live_pipeline_completed_row, live_pipeline_timestamp,
+                              live_pipeline_update_row,
                               newest_report_keys,
                               prepare_fight_module, report_modified_text, report_path_key,
                               read_console_update, redact_console_text, saved_guild_ids,
@@ -18,8 +24,12 @@ if __package__:
                               validate_learner_selection)
 else:
     from encounter_parser import EncounterRef
-    from wow_log_gui import (fight_module_catalog, filter_checked_report_paths,
+    from wow_log_gui import (LivePipelineAPIError, fight_module_catalog,
+                             filter_checked_report_paths,
+                             fetch_live_pipeline_snapshot,
                              group_cross_report_encounters, guild_data_directory,
+                             live_pipeline_completed_row, live_pipeline_timestamp,
+                             live_pipeline_update_row,
                              newest_report_keys,
                              prepare_fight_module, report_modified_text, report_path_key,
                              read_console_update, redact_console_text, saved_guild_ids,
@@ -27,6 +37,38 @@ else:
                              parse_warcraft_import_progress, warcraft_import_progress_lines,
                              selectable_report_paths,
                              validate_learner_selection)
+
+
+class FakeJSONResponse:
+    def __init__(self, payload):
+        self.content = json.dumps(payload).encode('utf-8')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, limit=-1):
+        return self.content if limit < 0 else self.content[:limit]
+
+
+class RecordingJSONOpener:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def __call__(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return FakeJSONResponse(response)
+
+
+def json_http_error(url, status, payload):
+    return HTTPError(
+        url, status, 'test failure', {}, io.BytesIO(json.dumps(payload).encode('utf-8')))
 
 
 def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
@@ -40,6 +82,93 @@ def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
         end=120,
         external_id=attempt if external_id is None else external_id,
     )
+
+
+class LivePipelineGuiTests(unittest.TestCase):
+    def test_backend_downtime_is_reported_as_a_safe_structured_error(self):
+        opener = RecordingJSONOpener([URLError('private transport detail')])
+
+        with self.assertRaises(LivePipelineAPIError) as raised:
+            fetch_live_pipeline_snapshot('1562210615466917909', opener=opener)
+
+        self.assertEqual(raised.exception.code, 'LIVE_BACKEND_UNAVAILABLE')
+        self.assertNotIn('private transport detail', str(raised.exception))
+
+    def test_snapshot_reads_only_loopback_get_endpoints_without_credentials(self):
+        opener = RecordingJSONOpener([
+            {'source_type': 'remote_live_log', 'configured': True, 'cursor': 2,
+             'parse_errors': 0},
+            {'updates': [{'cursor': 2, 'type': 'combat_event'}], 'truncated': False},
+            json_http_error('http://127.0.0.1/live/encounter', 404, {
+                'error': {'code': 'NO_ACTIVE_ENCOUNTER', 'message': 'No encounter.'},
+            }),
+            {'encounters': [{'attempt': 1, 'name': 'Test Boss', 'kill': False}]},
+        ])
+
+        snapshot = fetch_live_pipeline_snapshot('1562210615466917909', opener=opener)
+
+        self.assertEqual(snapshot['status']['source_type'], 'remote_live_log')
+        self.assertIsNone(snapshot['encounter'])
+        self.assertEqual(snapshot['updates'][0]['cursor'], 2)
+        self.assertEqual(snapshot['completed'][0]['name'], 'Test Boss')
+        self.assertEqual(len(opener.requests), 4)
+        for request, timeout in opener.requests:
+            headers = {key.casefold(): value for key, value in request.header_items()}
+            self.assertTrue(request.full_url.startswith('http://127.0.0.1:8765/api/v1/live/'))
+            self.assertEqual(request.get_method(), 'GET')
+            self.assertEqual(headers['x-carter-guild-id'], '1562210615466917909')
+            self.assertFalse(any('token' in key or 'authorization' in key for key in headers))
+            self.assertEqual(timeout, 2.0)
+
+    def test_snapshot_recovers_an_expired_update_cursor(self):
+        opener = RecordingJSONOpener([
+            {'source_type': 'remote_live_log', 'configured': True, 'cursor': 50},
+            json_http_error('http://127.0.0.1/live/updates', 409, {
+                'error': {'code': 'CURSOR_EXPIRED', 'message': 'Expired.',
+                          'oldest_cursor': 41},
+            }),
+            {'updates': [{'cursor': 41, 'type': 'encounter_start'}], 'truncated': False},
+            json_http_error('http://127.0.0.1/live/encounter', 404, {
+                'error': {'code': 'NO_ACTIVE_ENCOUNTER', 'message': 'No encounter.'},
+            }),
+            {'encounters': []},
+        ])
+
+        snapshot = fetch_live_pipeline_snapshot(
+            '1562210615466917909', since_cursor=12, opener=opener)
+
+        update_urls = [request.full_url for request, _timeout in opener.requests
+                       if '/live/updates?' in request.full_url]
+        self.assertEqual(len(update_urls), 2)
+        self.assertIn('since=12', update_urls[0])
+        self.assertIn('since=40', update_urls[1])
+        self.assertEqual(snapshot['updates'][0]['cursor'], 41)
+
+    def test_live_rows_allowlist_structured_fields_and_hide_raw_values(self):
+        update = live_pipeline_update_row({
+            'timestamp': '2026-10-25T19:34:03+00:00',
+            'type': 'combat_event', 'ability': 'Safe\nAbility', 'source': 'Player',
+            'raw_line': 'private combat log line', 'access_token': 'secret-token',
+        })
+        completed = live_pipeline_completed_row({
+            'attempt': 3, 'name': 'Test Boss', 'kill': True,
+            'duration_seconds': 92.25, 'deaths': 1, 'private_path': '/private/path',
+        })
+
+        self.assertEqual(update[1], 'combat_event')
+        self.assertIn('Safe Ability', update[2])
+        self.assertNotIn('private combat log line', ' '.join(update))
+        self.assertNotIn('secret-token', ' '.join(update))
+        self.assertEqual(completed, ('3', 'Test Boss', 'Kill', '92.2s', '1'))
+        self.assertNotIn('/private/path', ' '.join(completed))
+
+    def test_live_timestamp_reports_recency(self):
+        shown = live_pipeline_timestamp(
+            '2026-10-25T19:34:03+00:00',
+            datetime(2026, 10, 25, 19, 34, 33, tzinfo=timezone.utc),
+        )
+        self.assertIn('(30s ago)', shown)
+        self.assertEqual(live_pipeline_timestamp(None), 'No events received')
 
 
 class GuiLearnerSelectionTests(unittest.TestCase):

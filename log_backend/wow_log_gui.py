@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -13,6 +14,9 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 if __package__:
     from .carter_control import CarterProcessController
@@ -47,6 +51,153 @@ def default_log() -> Path | None:
 CONSOLE_READ_BYTES = 256 * 1024
 CONSOLE_MAX_CHARS = 300_000
 WARCRAFT_IMPORT_LOG_MARKER = 'WCL_IMPORT_PROGRESS '
+LIVE_PIPELINE_API_BASE = 'http://127.0.0.1:8765/api/v1'
+LIVE_PIPELINE_POLL_SECONDS = 2.0
+LIVE_PIPELINE_RESPONSE_LIMIT = 2 * 1024 * 1024
+
+
+class LivePipelineAPIError(RuntimeError):
+    """A safe, structured failure from Carter's loopback-only live API."""
+
+    def __init__(self, code, status=None, payload=None):
+        super().__init__(str(code))
+        self.code = str(code)
+        self.status = status
+        self.payload = payload if isinstance(payload, dict) else {}
+
+
+def _valid_guild_id(value):
+    value = str(value or '').strip()
+    return value if value.isdecimal() and 1 <= len(value) <= 20 and int(value) > 0 else None
+
+
+def _live_pipeline_json(path, guild_id, *, opener=urlopen, timeout=2.0):
+    """Read one allowlisted loopback endpoint without sending live credentials."""
+    guild_id = _valid_guild_id(guild_id)
+    if guild_id is None:
+        raise LivePipelineAPIError('INVALID_GUILD_ID')
+    if not re.fullmatch(
+            r'/live/(?:status|encounter|completed|updates(?:\?[A-Za-z0-9=&]+)?)', path):
+        raise LivePipelineAPIError('INVALID_LIVE_ENDPOINT')
+    request = Request(
+        LIVE_PIPELINE_API_BASE + path,
+        method='GET',
+        headers={'Accept': 'application/json', 'X-Carter-Guild-ID': guild_id},
+    )
+    try:
+        response = opener(request, timeout=timeout)
+        with response:
+            content = response.read(LIVE_PIPELINE_RESPONSE_LIMIT + 1)
+            if len(content) > LIVE_PIPELINE_RESPONSE_LIMIT:
+                raise LivePipelineAPIError('LIVE_RESPONSE_TOO_LARGE')
+            payload = json.loads(content.decode('utf-8'))
+    except HTTPError as error:
+        try:
+            payload = json.loads(error.read(LIVE_PIPELINE_RESPONSE_LIMIT).decode('utf-8'))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            payload = {}
+        code = payload.get('error', {}).get('code', f'HTTP_{error.code}')
+        raise LivePipelineAPIError(code, error.code, payload) from error
+    except (OSError, URLError, UnicodeError, json.JSONDecodeError) as error:
+        raise LivePipelineAPIError('LIVE_BACKEND_UNAVAILABLE') from error
+    if not isinstance(payload, dict):
+        raise LivePipelineAPIError('INVALID_LIVE_RESPONSE')
+    return payload
+
+
+def fetch_live_pipeline_snapshot(guild_id, since_cursor=0, *, opener=urlopen):
+    """Fetch a bounded structured snapshot from Carter's private loopback API."""
+    status = _live_pipeline_json('/live/status', guild_id, opener=opener)
+    try:
+        since = max(0, int(since_cursor))
+    except (TypeError, ValueError):
+        since = 0
+    status_cursor = status.get('cursor')
+    if isinstance(status_cursor, int) and status_cursor < since:
+        since = 0
+
+    query = urlencode({'since': since, 'limit': 100})
+    try:
+        updates = _live_pipeline_json(f'/live/updates?{query}', guild_id, opener=opener)
+    except LivePipelineAPIError as error:
+        details = error.payload.get('error', {})
+        oldest = details.get('oldest_cursor')
+        if error.code != 'CURSOR_EXPIRED' or not isinstance(oldest, int):
+            raise
+        query = urlencode({'since': max(0, oldest - 1), 'limit': 100})
+        updates = _live_pipeline_json(f'/live/updates?{query}', guild_id, opener=opener)
+
+    try:
+        encounter = _live_pipeline_json('/live/encounter', guild_id, opener=opener)
+    except LivePipelineAPIError as error:
+        if error.status != 404:
+            raise
+        encounter = None
+    completed = _live_pipeline_json('/live/completed', guild_id, opener=opener)
+    return {
+        'status': status,
+        'encounter': encounter,
+        'updates': updates.get('updates', []) if isinstance(updates.get('updates'), list) else [],
+        'updates_truncated': bool(updates.get('truncated')),
+        'completed': (completed.get('encounters', [])
+                      if isinstance(completed.get('encounters'), list) else []),
+    }
+
+
+def live_pipeline_timestamp(value, now=None):
+    """Format an API timestamp without leaking any source location."""
+    if not value:
+        return 'No events received'
+    try:
+        moment = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        age = max(0, int((current - moment.astimezone(timezone.utc)).total_seconds()))
+        if age < 60:
+            age_text = f'{age}s ago'
+        elif age < 3600:
+            age_text = f'{age // 60}m ago'
+        else:
+            age_text = f'{age // 3600}h ago'
+        return f'{moment.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")} ({age_text})'
+    except (TypeError, ValueError):
+        return 'Invalid event timestamp'
+
+
+def live_pipeline_update_row(update):
+    """Return allowlisted display fields for one live update; never raw log data."""
+    if not isinstance(update, dict):
+        return ('', 'unknown', '')
+    timestamp = str(update.get('timestamp') or '')
+    try:
+        shown_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).astimezone().strftime(
+            '%H:%M:%S')
+    except (TypeError, ValueError):
+        shown_time = ''
+    kind = str(update.get('type') or update.get('event_type') or 'update')[:80]
+    detail_parts = []
+    for key in ('ability', 'source', 'target', 'status'):
+        value = update.get(key)
+        if value not in (None, ''):
+            detail_parts.append(str(value).replace('\r', ' ').replace('\n', ' ')[:100])
+    return shown_time, kind, ' → '.join(detail_parts)[:240]
+
+
+def live_pipeline_completed_row(encounter):
+    """Return allowlisted display fields for one completed live attempt."""
+    encounter = encounter if isinstance(encounter, dict) else {}
+    duration = encounter.get('duration_seconds')
+    duration_text = f'{float(duration):.1f}s' if isinstance(duration, (int, float)) else '—'
+    kill = encounter.get('kill')
+    result = 'Kill' if kill is True else 'Wipe' if kill is False else 'Unknown'
+    return (
+        str(encounter.get('attempt') or '—'),
+        str(encounter.get('name') or 'Unknown encounter')[:120],
+        result,
+        duration_text,
+        str(encounter.get('deaths') if isinstance(encounter.get('deaths'), int) else '—'),
+    )
 
 
 _CONSOLE_SECRET_PATTERNS = (
@@ -2168,6 +2319,19 @@ class Launcher:
         self.live_storage = Path(__file__).resolve().parent / 'data'
         guilds = saved_guild_ids()
         self.live_guild_id = tk.StringVar(value=guilds[0] if len(guilds) == 1 else '')
+        self.live_pipeline_messages = queue.SimpleQueue()
+        self.live_pipeline_busy = False
+        self.live_pipeline_has_snapshot = False
+        self.live_pipeline_next_poll = 0.0
+        self.live_pipeline_guild = None
+        self.live_pipeline_cursor = 0
+        self.live_pipeline_updates = deque(maxlen=100)
+        self.live_pipeline_connection = tk.StringVar(value='Waiting for a valid guild ID.')
+        self.live_pipeline_source = tk.StringVar(value='Source: waiting')
+        self.live_pipeline_state = tk.StringVar(value='Encounter state: waiting')
+        self.live_pipeline_event = tk.StringVar(value='Last event: waiting')
+        self.live_pipeline_parse = tk.StringVar(value='Parse errors: waiting')
+        self.live_pipeline_encounter = tk.StringVar(value='No active encounter.')
         self.console_status = tk.StringVar(value='Console tail starting...')
         self.console_paths = {
             'carter': self.carter.log_path,
@@ -2187,13 +2351,21 @@ class Launcher:
         body.pack(fill='both', expand=True)
         ttk.Label(body, text='WoW Combat Log Tools', font=('', 18, 'bold')).pack(anchor='w')
         ttk.Label(body, text='Choose a local log or import a Warcraft Logs report, then analyze its encounters.',
-                  padding=(0, 4, 0, 18)).pack(anchor='w')
-        path_row = ttk.Frame(body)
+                  padding=(0, 4, 0, 10)).pack(anchor='w')
+
+        self.workspace_notebook = ttk.Notebook(body)
+        self.workspace_notebook.pack(fill='both', expand=True)
+        tools_body = ttk.Frame(self.workspace_notebook, padding=(10, 12))
+        live_pipeline_body = ttk.Frame(self.workspace_notebook, padding=(10, 12))
+        self.workspace_notebook.add(tools_body, text='Tools')
+        self.workspace_notebook.add(live_pipeline_body, text='Live pipeline')
+
+        path_row = ttk.Frame(tools_body)
         path_row.pack(fill='x')
         ttk.Entry(path_row, textvariable=self.path).pack(side='left', fill='x', expand=True)
         ttk.Button(path_row, text='Browse...', command=self.browse).pack(side='left', padx=(8, 0))
 
-        services = ttk.LabelFrame(body, text='Carter service', padding=10)
+        services = ttk.LabelFrame(tools_body, text='Carter service', padding=10)
         services.pack(fill='x', pady=(18, 0))
         services.columnconfigure(0, weight=1)
         ttk.Label(services, textvariable=self.carter_status).grid(
@@ -2224,7 +2396,7 @@ class Launcher:
             text='The token value stays private on disk; only its fingerprint is displayed.',
         ).grid(row=3, column=1, sticky='e', padx=(12, 0), pady=(8, 0))
 
-        actions = ttk.Frame(body, padding=(0, 18, 0, 0))
+        actions = ttk.Frame(tools_body, padding=(0, 18, 0, 0))
         actions.pack(fill='x')
         for column in range(3):
             actions.columnconfigure(column, weight=1, uniform='launcher-actions')
@@ -2242,10 +2414,10 @@ class Launcher:
         fight_modules = ttk.Button(actions, text='Fight modules',
                                    command=self.open_fight_modules)
         fight_modules.grid(row=1, column=1, sticky='nsew', padx=6, pady=(6, 0))
-        ttk.Label(body, text='View damage, healing, DPS/HPS, rank, and position, or export timeline CSV files.')\
+        ttk.Label(tools_body, text='View damage, healing, DPS/HPS, rank, and position, or export timeline CSV files.')\
             .pack(anchor='w', pady=(14, 0))
 
-        console = ttk.LabelFrame(body, text='Live diagnostics console', padding=8)
+        console = ttk.LabelFrame(tools_body, text='Live diagnostics console', padding=8)
         console.pack(fill='both', expand=True, pady=(14, 0))
         ttk.Label(
             console, textvariable=self.console_import_status, anchor='w',
@@ -2286,8 +2458,80 @@ class Launcher:
             self.console_tab_names.append(name)
             self.console_views[name] = view
         self.console_notebook.bind('<<NotebookTabChanged>>', self.refresh_console_status)
+        self._build_live_pipeline_tab(live_pipeline_body)
         self.refresh_live_token_status()
         self.poll_services()
+
+    def _build_live_pipeline_tab(self, parent):
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill='x')
+        ttk.Label(
+            toolbar, textvariable=self.live_pipeline_connection, font=('', 11, 'bold'),
+        ).pack(side='left', fill='x', expand=True)
+        ttk.Button(toolbar, text='Refresh now', command=self.refresh_live_pipeline_now).pack(
+            side='right')
+        ttk.Label(
+            parent,
+            text=('Reads structured status from Carter on 127.0.0.1 only. '
+                  'Private analysis APIs remain unavailable through Nginx.'),
+        ).pack(anchor='w', pady=(3, 10))
+
+        summary = ttk.LabelFrame(parent, text='Pipeline status', padding=10)
+        summary.pack(fill='x')
+        summary.columnconfigure(0, weight=1)
+        summary.columnconfigure(1, weight=1)
+        ttk.Label(summary, textvariable=self.live_pipeline_source).grid(
+            row=0, column=0, sticky='w')
+        ttk.Label(summary, textvariable=self.live_pipeline_state).grid(
+            row=0, column=1, sticky='w', padx=(20, 0))
+        ttk.Label(summary, textvariable=self.live_pipeline_event).grid(
+            row=1, column=0, sticky='w', pady=(7, 0))
+        ttk.Label(summary, textvariable=self.live_pipeline_parse).grid(
+            row=1, column=1, sticky='w', padx=(20, 0), pady=(7, 0))
+
+        encounter = ttk.LabelFrame(parent, text='Current encounter', padding=10)
+        encounter.pack(fill='x', pady=(10, 0))
+        ttk.Label(encounter, textvariable=self.live_pipeline_encounter).pack(anchor='w')
+
+        tables = ttk.Panedwindow(parent, orient='vertical')
+        tables.pack(fill='both', expand=True, pady=(10, 0))
+        updates_frame = ttk.LabelFrame(tables, text='Recent structured updates', padding=6)
+        completed_frame = ttk.LabelFrame(tables, text='Completed attempts', padding=6)
+        tables.add(updates_frame, weight=1)
+        tables.add(completed_frame, weight=1)
+
+        update_columns = ('time', 'type', 'detail')
+        self.live_pipeline_update_table = ttk.Treeview(
+            updates_frame, columns=update_columns, show='headings', height=8)
+        for column, label, width, anchor in (
+                ('time', 'Time', 90, 'center'), ('type', 'Update', 170, 'w'),
+                ('detail', 'Structured detail', 650, 'w')):
+            self.live_pipeline_update_table.heading(column, text=label)
+            self.live_pipeline_update_table.column(column, width=width, anchor=anchor)
+        update_scroll = ttk.Scrollbar(
+            updates_frame, orient='vertical', command=self.live_pipeline_update_table.yview)
+        self.live_pipeline_update_table.configure(yscrollcommand=update_scroll.set)
+        self.live_pipeline_update_table.grid(row=0, column=0, sticky='nsew')
+        update_scroll.grid(row=0, column=1, sticky='ns')
+        updates_frame.rowconfigure(0, weight=1)
+        updates_frame.columnconfigure(0, weight=1)
+
+        completed_columns = ('attempt', 'encounter', 'result', 'duration', 'deaths')
+        self.live_pipeline_completed_table = ttk.Treeview(
+            completed_frame, columns=completed_columns, show='headings', height=7)
+        for column, label, width, anchor in (
+                ('attempt', 'Attempt', 75, 'center'), ('encounter', 'Encounter', 480, 'w'),
+                ('result', 'Result', 90, 'center'), ('duration', 'Duration', 90, 'center'),
+                ('deaths', 'Deaths', 75, 'center')):
+            self.live_pipeline_completed_table.heading(column, text=label)
+            self.live_pipeline_completed_table.column(column, width=width, anchor=anchor)
+        completed_scroll = ttk.Scrollbar(
+            completed_frame, orient='vertical', command=self.live_pipeline_completed_table.yview)
+        self.live_pipeline_completed_table.configure(yscrollcommand=completed_scroll.set)
+        self.live_pipeline_completed_table.grid(row=0, column=0, sticky='nsew')
+        completed_scroll.grid(row=0, column=1, sticky='ns')
+        completed_frame.rowconfigure(0, weight=1)
+        completed_frame.columnconfigure(0, weight=1)
 
     def active_console_name(self):
         try:
@@ -2573,6 +2817,159 @@ class Launcher:
         self.live_token_status.set(
             f"Live token: {verb} (fingerprint {info['fingerprint']})")
 
+    def refresh_live_pipeline_now(self):
+        self.live_pipeline_next_poll = 0.0
+        self._start_live_pipeline_poll()
+
+    def _start_live_pipeline_poll(self):
+        if self.live_pipeline_busy or time.monotonic() < self.live_pipeline_next_poll:
+            return
+        guild_id = _valid_guild_id(self.live_guild_id.get())
+        if guild_id is None:
+            self.live_pipeline_connection.set('Enter one valid Discord guild ID to monitor.')
+            self.live_pipeline_next_poll = time.monotonic() + LIVE_PIPELINE_POLL_SECONDS
+            return
+        if guild_id != self.live_pipeline_guild:
+            self.live_pipeline_guild = guild_id
+            self.live_pipeline_cursor = 0
+            self.live_pipeline_has_snapshot = False
+            self.live_pipeline_updates.clear()
+            self.live_pipeline_update_table.delete(
+                *self.live_pipeline_update_table.get_children())
+            self.live_pipeline_completed_table.delete(
+                *self.live_pipeline_completed_table.get_children())
+
+        self.live_pipeline_busy = True
+        if not self.live_pipeline_has_snapshot:
+            self.live_pipeline_connection.set('Checking the local analysis backend…')
+        since = self.live_pipeline_cursor
+
+        def work():
+            try:
+                snapshot = fetch_live_pipeline_snapshot(guild_id, since)
+                self.live_pipeline_messages.put(('result', guild_id, snapshot))
+            except LivePipelineAPIError as error:
+                self.live_pipeline_messages.put(('error', guild_id, error.code))
+            except Exception:
+                self.live_pipeline_messages.put(
+                    ('error', guild_id, 'LIVE_BACKEND_UNAVAILABLE'))
+
+        threading.Thread(
+            target=work, name='carter-gui-live-pipeline', daemon=True,
+        ).start()
+
+    def _apply_live_pipeline_snapshot(self, snapshot):
+        status = snapshot.get('status') if isinstance(snapshot, dict) else {}
+        status = status if isinstance(status, dict) else {}
+        source_type = str(status.get('source_type') or 'unknown').replace('_', ' ')
+        configured = status.get('configured') is True
+        available = status.get('available') is True
+        self.live_pipeline_source.set(
+            f'Source: {source_type} · configured: {"yes" if configured else "no"} '
+            f'· available: {"yes" if available else "no"}')
+
+        encounter_state = str(status.get('encounter_state') or 'unknown')
+        duration = status.get('fight_time_seconds')
+        duration_text = (f' · fight time: {float(duration):.1f}s'
+                         if isinstance(duration, (int, float)) else '')
+        stale_text = ' · stale' if status.get('stale') else ''
+        self.live_pipeline_state.set(
+            f'Encounter state: {encounter_state}{duration_text}{stale_text}')
+        self.live_pipeline_event.set(
+            f'Last event: {live_pipeline_timestamp(status.get("last_event_at"))}')
+
+        parse_errors = status.get('parse_errors')
+        if isinstance(parse_errors, int) and parse_errors == 0:
+            parse_text = 'Parse errors: 0'
+        elif isinstance(parse_errors, int):
+            parse_text = (f'Parse errors: {parse_errors} '
+                          '(unrecognized input lines; raw content remains hidden)')
+        else:
+            parse_text = 'Parse errors: unavailable'
+        self.live_pipeline_parse.set(parse_text)
+
+        encounter = snapshot.get('encounter')
+        if encounter_state == 'active' and isinstance(encounter, dict):
+            name = str(encounter.get('name') or 'Unknown encounter')[:120]
+            attempt = encounter.get('attempt')
+            difficulty = encounter.get('difficulty')
+            size = encounter.get('size')
+            fields = [f'{name} · attempt {attempt if attempt is not None else "—"}']
+            if difficulty is not None:
+                fields.append(f'difficulty {difficulty}')
+            if size is not None:
+                fields.append(f'{size} players')
+            self.live_pipeline_encounter.set(' · '.join(fields))
+        else:
+            self.live_pipeline_encounter.set(
+                f'No active encounter. Pipeline state is {encounter_state}.')
+
+        status_cursor = status.get('cursor')
+        if isinstance(status_cursor, int) and status_cursor < self.live_pipeline_cursor:
+            self.live_pipeline_cursor = 0
+            self.live_pipeline_updates.clear()
+        known = {
+            item.get('cursor') for item in self.live_pipeline_updates
+            if isinstance(item, dict) and isinstance(item.get('cursor'), int)
+        }
+        for update in snapshot.get('updates', []):
+            if not isinstance(update, dict):
+                continue
+            cursor = update.get('cursor')
+            if isinstance(cursor, int):
+                self.live_pipeline_cursor = max(self.live_pipeline_cursor, cursor)
+                if cursor in known:
+                    continue
+                known.add(cursor)
+            self.live_pipeline_updates.append(update)
+
+        self.live_pipeline_update_table.delete(
+            *self.live_pipeline_update_table.get_children())
+        for index, update in enumerate(self.live_pipeline_updates):
+            self.live_pipeline_update_table.insert(
+                '', 'end', iid=f'update-{index}', values=live_pipeline_update_row(update))
+        children = self.live_pipeline_update_table.get_children()
+        if children:
+            self.live_pipeline_update_table.see(children[-1])
+
+        self.live_pipeline_completed_table.delete(
+            *self.live_pipeline_completed_table.get_children())
+        for index, completed in enumerate(snapshot.get('completed', [])):
+            self.live_pipeline_completed_table.insert(
+                '', 'end', iid=f'completed-{index}',
+                values=live_pipeline_completed_row(completed))
+
+        checked_at = datetime.now().astimezone().strftime('%H:%M:%S %Z')
+        self.live_pipeline_has_snapshot = True
+        self.live_pipeline_connection.set(f'Connected to local backend · checked {checked_at}')
+
+    def poll_live_pipeline(self):
+        try:
+            while True:
+                kind, guild_id, payload = self.live_pipeline_messages.get_nowait()
+                self.live_pipeline_busy = False
+                if guild_id != _valid_guild_id(self.live_guild_id.get()):
+                    continue
+                if kind == 'result':
+                    self._apply_live_pipeline_snapshot(payload)
+                    delay = 0.0 if payload.get('updates_truncated') else \
+                        LIVE_PIPELINE_POLL_SECONDS
+                    self.live_pipeline_next_poll = time.monotonic() + delay
+                else:
+                    messages = {
+                        'LIVE_BACKEND_UNAVAILABLE':
+                            'Local analysis backend unavailable; retrying in the background.',
+                        'INVALID_GUILD_ID': 'Enter one valid Discord guild ID to monitor.',
+                    }
+                    detail = messages.get(
+                        payload, f'Local live API returned {payload}; retrying in the background.')
+                    self.live_pipeline_connection.set(detail)
+                    self.live_pipeline_next_poll = (
+                        time.monotonic() + LIVE_PIPELINE_POLL_SECONDS)
+        except queue.Empty:
+            pass
+        self._start_live_pipeline_poll()
+
     def poll_services(self):
         try:
             while True:
@@ -2586,6 +2983,7 @@ class Launcher:
             pass
         self.refresh_carter_status()
         self.poll_console_logs()
+        self.poll_live_pipeline()
         if self.root.winfo_exists():
             self.root.after(1000, self.poll_services)
 
