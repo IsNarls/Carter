@@ -5,27 +5,42 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from copy import deepcopy
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from queue import Empty, Full, Queue
 import re
+import shutil
+import sys
 import threading
 import uuid
 
 if __package__:
-    from .encounter_parser import analyze_encounter, scan_encounters
+    from .encounter_parser import (analyze_encounter, scan_encounters,
+                                   scan_warcraft_logs_encounters)
     from .warcraft_logs_importer import (
         WarcraftLogsClient,
         WarcraftLogsError,
+        WarcraftLogsRateLimitError,
+        download_checkpoint_path,
         extract_report_code,
         load_credentials,
+        analysis_directory,
+        metadata_path,
+        load_cache,
     )
 else:  # Support ``python analysis_api.py`` from this directory.
-    from encounter_parser import analyze_encounter, scan_encounters
+    from encounter_parser import (analyze_encounter, scan_encounters,
+                                  scan_warcraft_logs_encounters)
     from warcraft_logs_importer import (
         WarcraftLogsClient,
         WarcraftLogsError,
+        WarcraftLogsRateLimitError,
+        download_checkpoint_path,
         extract_report_code,
         load_credentials,
+        analysis_directory,
+        metadata_path,
+        load_cache,
     )
 
 
@@ -36,7 +51,7 @@ MAX_PROGRESS_EVENTS = 50
 MAX_JOB_ERRORS = 50
 JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 ACTIVE_STATES = frozenset({"queued", "running"})
-TERMINAL_STATES = frozenset({"succeeded", "partial", "failed"})
+TERMINAL_STATES = frozenset({"succeeded", "partial", "failed", "rate_limited"})
 
 
 def _now() -> str:
@@ -109,7 +124,7 @@ class ReportImportJobManager:
             self._jobs.pop(removable, None)
             self._progress.pop(removable, None)
 
-    def submit(self, report_url: str) -> dict:
+    def submit(self, report_url: str, *, refresh: bool = False) -> dict:
         if not isinstance(report_url, str) or not report_url.strip():
             raise ImportJobError(
                 "REPORT_URL_REQUIRED", "report_url must be a Warcraft Logs URL or report code."
@@ -118,6 +133,8 @@ class ReportImportJobManager:
             report_id = extract_report_code(report_url)
         except ValueError as error:
             raise ImportJobError("INVALID_REPORT_URL", str(error)) from error
+        if not isinstance(refresh, bool):
+            raise ImportJobError("INVALID_REFRESH", "refresh must be true or false.")
 
         with self._lock:
             for existing in self._jobs.values():
@@ -146,12 +163,14 @@ class ReportImportJobManager:
                 "schema_version": IMPORT_SCHEMA_VERSION,
                 "job_id": job_id,
                 "report_id": report_id,
+                "refresh": refresh,
                 "status": "queued",
                 "stage": "queued",
                 "created_at": timestamp,
                 "updated_at": timestamp,
                 "progress": {
                     "message": "Report import queued.",
+                    "percent": None,
                     "completed_fights": 0,
                     "total_fights": None,
                 },
@@ -170,6 +189,7 @@ class ReportImportJobManager:
                 raise ImportJobError(
                     "IMPORT_CAPACITY_REACHED", "The report import queue is full.", 429
                 )
+            self._log_progress_locked(self._jobs[job_id])
             return self._public_locked(job_id)
 
     def get(self, job_id: str) -> dict:
@@ -180,10 +200,112 @@ class ReportImportJobManager:
                 raise ImportJobError("IMPORT_JOB_NOT_FOUND", "The import job was not found.", 404)
             return self._public_locked(job_id)
 
+    def reset_report_data(self) -> dict:
+        """Delete this guild's Warcraft Logs caches and retained import state."""
+        with self._lock:
+            if any(job["status"] in ACTIVE_STATES for job in self._jobs.values()):
+                raise ImportJobError(
+                    "IMPORTS_ACTIVE",
+                    "Guild report data cannot be reset while an import is queued or running.",
+                    409,
+                )
+
+            report_ids = {job["report_id"] for job in self._jobs.values()}
+            artifact = re.compile(
+                r"warcraft-logs-([A-Za-z0-9]{8,32})"
+                r"(?:\.wcl\.json(?:\.download\.json)?|\.meta\.json|\.analysis)"
+                r"(?:\.tmp|\.part)?$",
+                re.IGNORECASE,
+            )
+            # Discover report IDs from every recognized final or atomic-temporary
+            # artifact. This also cleans interrupted imports that never produced a
+            # final cache/job record, without touching unrelated guild files.
+            for path in self.storage.glob("warcraft-logs-*"):
+                match = artifact.fullmatch(path.name)
+                if match:
+                    report_ids.add(match.group(1))
+
+            removed_files = 0
+            removed_analysis = 0
+            try:
+                for report_id in report_ids:
+                    cache = self.storage / f"warcraft-logs-{report_id}.wcl.json"
+                    related_files = (
+                        cache,
+                        cache.with_name(cache.name + ".tmp"),
+                        cache.with_name(cache.name + ".part"),
+                        metadata_path(cache),
+                        metadata_path(cache).with_name(metadata_path(cache).name + ".tmp"),
+                        metadata_path(cache).with_name(metadata_path(cache).name + ".part"),
+                        cache.with_name(cache.name + ".download.json"),
+                        cache.with_name(cache.name + ".download.json.tmp"),
+                        cache.with_name(cache.name + ".download.json.part"),
+                    )
+                    for path in related_files:
+                        if path.is_file() or path.is_symlink():
+                            path.unlink()
+                            removed_files += 1
+                    sidecar = analysis_directory(cache)
+                    if sidecar.is_symlink():
+                        sidecar.unlink()
+                        removed_files += 1
+                    elif sidecar.is_dir() and sidecar.resolve().parent == self.storage:
+                        shutil.rmtree(sidecar)
+                        removed_analysis += 1
+            except OSError as error:
+                raise ImportJobError(
+                    "RESET_FAILED", "Guild report data could not be fully reset.", 500,
+                ) from error
+
+            for report_id in sorted(report_ids, key=str.casefold):
+                timestamp = _now()
+                event = {
+                    "report_id": report_id,
+                    "status": "reset",
+                    "stage": "reset",
+                    "progress": {
+                        "percent": None,
+                        "completed_fights": 0,
+                        "total_fights": None,
+                        "message": "Guild report data was reset.",
+                    },
+                    "errors": [],
+                }
+                print(
+                    f"{timestamp} WCL_IMPORT_PROGRESS "
+                    f"{json.dumps(event, ensure_ascii=True, separators=(',', ':'))}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self._jobs.clear()
+            self._progress.clear()
+            return {
+                "status": "reset",
+                "reports_removed": len(report_ids),
+                "files_removed": removed_files,
+                "analysis_directories_removed": removed_analysis,
+            }
+
     def _public_locked(self, job_id: str) -> dict:
         result = deepcopy(self._jobs[job_id])
         result["progress_events"] = deepcopy(list(self._progress.get(job_id, ())))
         return result
+
+    @staticmethod
+    def _log_progress_locked(job):
+        progress_event = {
+            "report_id": job["report_id"],
+            "status": job["status"],
+            "stage": job["stage"],
+            "progress": job["progress"],
+            "errors": job["errors"],
+        }
+        print(
+            f"{job['updated_at']} WCL_IMPORT_PROGRESS "
+            f"{json.dumps(progress_event, ensure_ascii=True, separators=(',', ':'))}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _update(self, job_id: str, *, status=None, stage=None, message=None, **progress):
         with self._lock:
@@ -197,8 +319,15 @@ class ReportImportJobManager:
             if message is not None:
                 job["progress"]["message"] = str(message)[:500]
             job["progress"].update(progress)
+            percent = job["progress"].get("percent")
+            if isinstance(percent, int):
+                percent = max(0, min(100, percent))
+                if job["status"] in ACTIVE_STATES:
+                    percent = min(99, percent)
+                job["progress"]["percent"] = percent
             job["updated_at"] = _now()
             if message is not None:
+                self._log_progress_locked(job)
                 self._progress[job_id].append({
                     "timestamp": job["updated_at"],
                     "stage": job["stage"],
@@ -215,6 +344,39 @@ class ReportImportJobManager:
 
     def _finish_failed(self, job_id: str, code: str, message: str):
         self._add_error(job_id, code, message)
+        self._update(job_id, status="failed", stage="failed", message=message)
+
+    def _finish_rate_limited(self, job_id: str, error: WarcraftLogsRateLimitError,
+                             checkpoint_saved: bool):
+        details = {"checkpoint_saved": bool(checkpoint_saved), "retryable": True}
+        if error.retry_after_seconds is not None:
+            details["retry_after_seconds"] = error.retry_after_seconds
+        message = (
+            "Warcraft Logs rate limit reached. Saved progress will resume on the next import."
+            if checkpoint_saved else
+            "Warcraft Logs rate limit reached before any download page was saved. Retry later."
+        )
+        self._add_error(
+            job_id, "RATE_LIMITED",
+            message,
+            **details,
+        )
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job["result"] = {"report_id": job["report_id"], **details}
+        self._update(
+            job_id, status="rate_limited", stage="paused",
+            message=message,
+        )
+
+    def _finish_download_failed(self, job_id: str, message: str,
+                                checkpoint_saved: bool):
+        details = {"checkpoint_saved": bool(checkpoint_saved),
+                   "retryable": bool(checkpoint_saved)}
+        self._add_error(job_id, "DOWNLOAD_FAILED", message, **details)
+        if checkpoint_saved:
+            message = message + " Saved pages will resume on the next import."
         self._update(job_id, status="failed", stage="failed", message=message)
 
     def _work(self):
@@ -239,45 +401,77 @@ class ReportImportJobManager:
             if job is None:
                 return
             report_id = job["report_id"]
-        self._update(
-            job_id, status="running", stage="configuration",
-            message="Loading backend Warcraft Logs credentials.",
-        )
-        try:
-            client_id, client_secret = self.credentials_loader()
-        except Exception as error:
-            self._finish_failed(
-                job_id, "CONFIGURATION_ERROR", self._safe_message(error)
-            )
-            return
-        if not client_id or not client_secret:
-            self._finish_failed(
-                job_id,
-                "CONFIGURATION_ERROR",
-                "Backend Warcraft Logs credentials are not configured.",
-            )
-            return
-        secrets = (client_id, client_secret)
+            refresh = bool(job.get("refresh"))
         destination = self.storage / f"warcraft-logs-{report_id}.wcl.json"
-        try:
-            self.storage.mkdir(parents=True, exist_ok=True)
-            client = self.client_factory(client_id, client_secret)
-            self._update(job_id, stage="download", message="Downloading Warcraft Logs report.")
+        encounters = None
+        cache_payload = None
+        cache_hit = False
+        secrets = ()
+        checkpoint = download_checkpoint_path(destination)
 
-            def download_progress(message):
-                safe = str(message)
-                for secret in secrets:
-                    if secret:
-                        safe = safe.replace(str(secret), "[redacted]")
-                self._update(job_id, stage="download", message=safe[:500])
+        if destination.is_file() and not refresh and not checkpoint.is_file():
+            try:
+                cache_payload = load_cache(destination)
+                encounters = scan_warcraft_logs_encounters(destination, cache_payload)
+                cache_hit = bool(encounters)
+            except Exception:
+                encounters = None
+            if cache_hit:
+                self._update(
+                    job_id, status="running", stage="cache",
+                    message="Using the previously downloaded local report cache.",
+                )
 
-            client.download_report(report_id, destination, download_progress)
-            encounters = scan_encounters(destination)
-        except Exception as error:
-            self._finish_failed(
-                job_id, "DOWNLOAD_FAILED", self._safe_message(error, secrets)
+        if not cache_hit:
+            self._update(
+                job_id, status="running", stage="configuration",
+                message="Loading backend Warcraft Logs credentials.",
+                percent=None, completed_fights=0, total_fights=None,
             )
-            return
+            try:
+                client_id, client_secret = self.credentials_loader()
+            except Exception as error:
+                self._finish_failed(
+                    job_id, "CONFIGURATION_ERROR", self._safe_message(error)
+                )
+                return
+            if not client_id or not client_secret:
+                self._finish_failed(
+                    job_id,
+                    "CONFIGURATION_ERROR",
+                    "Backend Warcraft Logs credentials are not configured.",
+                )
+                return
+            secrets = (client_id, client_secret)
+            try:
+                self.storage.mkdir(parents=True, exist_ok=True)
+                client = self.client_factory(client_id, client_secret)
+                self._update(
+                    job_id, stage="download", message="Downloading Warcraft Logs report.",
+                    percent=None, completed_fights=0, total_fights=None,
+                )
+
+                def download_progress(message):
+                    safe = str(message)
+                    for secret in secrets:
+                        if secret:
+                            safe = safe.replace(str(secret), "[redacted]")
+                    self._update(job_id, stage="download", message=safe[:500])
+
+                client.download_report(report_id, destination, download_progress)
+                cache_payload = load_cache(destination)
+                encounters = scan_warcraft_logs_encounters(destination, cache_payload)
+            except WarcraftLogsRateLimitError as error:
+                self._finish_rate_limited(
+                    job_id, error, checkpoint.is_file(),
+                )
+                return
+            except Exception as error:
+                self._finish_download_failed(
+                    job_id, self._safe_message(error, secrets),
+                    checkpoint.is_file(),
+                )
+                return
 
         total = len(encounters)
         if total == 0:
@@ -287,7 +481,7 @@ class ReportImportJobManager:
             return
         self._update(
             job_id, stage="analysis", message=f"Analyzing {total} boss fights.",
-            total_fights=total, completed_fights=0,
+            percent=0, total_fights=total, completed_fights=0,
         )
         fights = []
         analyzed = 0
@@ -295,7 +489,7 @@ class ReportImportJobManager:
             fight_id = encounter.external_id if encounter.external_id is not None else encounter.attempt
             try:
                 # analyze_encounter persists the result atomically through save_analysis.
-                analyze_encounter(destination, encounter)
+                analyze_encounter(destination, encounter, wcl_cache=cache_payload)
                 analyzed += 1
                 fights.append({
                     "fight_id": int(fight_id),
@@ -318,6 +512,7 @@ class ReportImportJobManager:
                 job_id,
                 stage="analysis",
                 message=f"Analyzed fight {index} of {total}.",
+                percent=min(99, int(index * 100 / total)),
                 completed_fights=index,
                 total_fights=total,
             )
@@ -330,6 +525,7 @@ class ReportImportJobManager:
                 return
             job["result"] = {
                 "report_id": report_id,
+                "cache_hit": cache_hit,
                 "fight_count": total,
                 "analyzed_fights": analyzed,
                 "failed_fights": failed,
@@ -339,7 +535,10 @@ class ReportImportJobManager:
             f"Imported and analyzed {analyzed} of {total} fights."
             if status != "failed" else "The report was imported, but no fights were analyzed."
         )
-        self._update(job_id, status=status, stage="complete", message=message)
+        self._update(
+            job_id, status=status, stage="complete", message=message,
+            percent=100, completed_fights=total, total_fights=total,
+        )
 
     def close(self, timeout: float = 1.0):
         self._stop.set()

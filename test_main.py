@@ -8,9 +8,10 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from analysis_client import AnalysisClientSettings, AnalysisImage
+from analysis_client import AnalysisClientError, AnalysisClientSettings, AnalysisImage
 from main import (
-    Carter, CarterVoiceClient, ai_configuration, analysis_configuration,
+    Carter, CarterVoiceClient, ai_configuration, analysis_backend_configuration,
+    analysis_configuration,
     wake_configuration, _format_job, _message_report_urls,
 )
 from raid_integration import RaidAnswer
@@ -22,7 +23,9 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             settings, limits = ai_configuration()
         self.assertEqual(settings.gemini_model, "gemini-3.8-live")
-        self.assertEqual(settings.gemini_text_model, "gemini-3.8-flash")
+        self.assertEqual(settings.gemini_text_model, "gemini-3.5-flash-lite")
+        self.assertEqual(settings.gemini_text_thinking_level, "minimal")
+        self.assertEqual(settings.gemini_text_timeout, 20)
         self.assertFalse(settings.tool_declarations)
         self.assertFalse(limits.allow_fallback)
         self.assertIn("Respond only in English", settings.instructions)
@@ -44,9 +47,21 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(configured.enabled)
         self.assertTrue(monitor)
 
+    def test_local_analysis_backend_is_managed_by_default_and_can_be_opted_out(self):
+        settings = AnalysisClientSettings(True, "http://127.0.0.1:8765/api/v1")
+        with patch.dict("os.environ", {}, clear=True):
+            managed, startup_timeout, health_interval = analysis_backend_configuration(settings)
+        self.assertTrue(managed)
+        self.assertEqual((startup_timeout, health_interval), (15, 15))
+        with patch.dict("os.environ", {"CARTER_ANALYSIS_MANAGE_BACKEND": "false"}, clear=True):
+            managed, _, _ = analysis_backend_configuration(settings)
+        self.assertFalse(managed)
+
     def test_invalid_provider_fallback_and_limits_are_rejected(self):
         for setting in ({"CARTER_AI_PROVIDER": "openai"},
                         {"CARTER_ALLOW_OPENAI_FALLBACK": "yes"},
+                        {"CARTER_GEMINI_TEXT_THINKING_LEVEL": "unbounded"},
+                        {"CARTER_GEMINI_TEXT_TIMEOUT": "0"},
                         {"CARTER_SESSION_TIMEOUT": "0"},
                         {"CARTER_MAX_SESSION_SECONDS": "999999"}):
             with patch.dict("os.environ", setting, clear=True):
@@ -123,6 +138,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.state.channel_id = 20
         self.fake_session = SimpleNamespace(
             active=False, owner_id=30, start=AsyncMock(), stop=AsyncMock(),
+            replay_audio=MagicMock(return_value=b""), clear_replay=MagicMock(),
             provider_name="gemini", settings=self.state.session.settings,
             state="inactive", usage={}, limits=self.state.session.limits,
             input_seconds=0, output_seconds=0, input_frames=0, speech_turns=0,
@@ -157,15 +173,46 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         carter = self.bot.tree.get_command("carter")
         self.assertEqual(
             {command.name for command in carter.commands},
-            {"join", "leave", "status", "activate", "stop", "ask",
+            {"join", "leave", "status", "activate", "stop", "replay", "ask",
              "setvoice", "setlogs", "voicechannel"},
         )
         logs = self.bot.tree.get_command("logs")
         self.assertEqual(
             {command.name for command in logs.commands},
             {"health", "reports", "fights", "select", "source", "summary", "ranking",
-             "player", "death", "deaths", "identity", "ingest", "import", "job"},
+             "player", "death", "deaths", "identity", "ingest", "import", "job", "reset"},
         )
+
+    async def test_logs_reset_requires_admin_and_explicit_confirmation(self):
+        await self.bot.logs_reset(self.interaction, confirm=True)
+        self.interaction.response.send_message.assert_awaited_once()
+        self.assertIn(
+            "Only a server administrator",
+            self.interaction.response.send_message.await_args.args[0],
+        )
+
+        self.interaction.user.guild_permissions = SimpleNamespace(administrator=True)
+        self.interaction.response.send_message.reset_mock()
+        await self.bot.logs_reset(self.interaction, confirm=False)
+        self.interaction.response.send_message.assert_awaited_once()
+        self.assertIn(
+            "No data was deleted",
+            self.interaction.response.send_message.await_args.args[0],
+        )
+
+    async def test_logs_reset_clears_only_after_admin_confirmation(self):
+        self.interaction.user.guild_permissions = SimpleNamespace(administrator=True)
+        self.state.raid.client.reset_import_data = AsyncMock(return_value={
+            "reports_removed": 2,
+        })
+
+        await self.bot.logs_reset(self.interaction, confirm=True)
+
+        self.state.raid.client.reset_import_data.assert_awaited_once()
+        self.interaction.response.defer.assert_awaited_once_with(
+            ephemeral=True, thinking=True,
+        )
+        self.assertIn("Reset complete", self.interaction.followup.send.await_args.args[0])
 
     async def test_generic_ask_uses_text_model_without_voice(self):
         with patch("main.generate_text", AsyncMock(return_value="Chat answer")) as generate:
@@ -179,11 +226,26 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_raid_ask_uses_deterministic_backend_result(self):
         self.bot.analysis_settings = AnalysisClientSettings(True)
-        self.bot.raid.answer_question = AsyncMock(return_value=RaidAnswer("Top DPS result"))
+        self.state.raid.answer_question = AsyncMock(return_value=RaidAnswer("Top DPS result"))
         with patch("main.generate_text", AsyncMock()) as generate:
             await self.bot.ask(self.interaction, "Who had top DPS?")
         self.assertEqual(self.interaction.followup.send.await_args.args[0], "Top DPS result")
         generate.assert_not_awaited()
+
+    async def test_analysis_request_recovers_managed_backend_and_retries_once(self):
+        self.bot.backend_controller = object()
+        operation = AsyncMock(side_effect=[AnalysisClientError("analysis_unavailable"), "ready"])
+        try:
+            with patch.object(
+                self.bot, "_recover_analysis_backend",
+                AsyncMock(return_value=SimpleNamespace(ok=True, code="started")),
+            ) as recover:
+                result = await self.bot._analysis_request(operation)
+            self.assertEqual(result, "ready")
+            self.assertEqual(operation.await_count, 2)
+            recover.assert_awaited_once_with()
+        finally:
+            self.bot.backend_controller = None
 
     async def test_logs_import_returns_job_id_and_accepts_backend_success_state(self):
         queued = RaidAnswer(
@@ -191,8 +253,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             "(job `job-1`).",
             tool_context={"job_id": "job-1", "report_id": "ReportABC123"},
         )
-        self.bot.raid.submit_report = AsyncMock(return_value=queued)
-        self.bot.analysis_client.import_job = AsyncMock(return_value={
+        self.state.raid.submit_report = AsyncMock(return_value=queued)
+        self.state.raid.client.import_job = AsyncMock(return_value={
             "job_id": "job-1", "report_id": "ReportABC123", "status": "succeeded",
             "progress": {"completed_fights": 2, "total_fights": 2},
             "result": {"report_id": "ReportABC123", "fight_count": 2,
@@ -206,12 +268,15 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         if tasks:
             await asyncio.gather(*tasks)
         self.assertIn("job `job-1`", self.interaction.followup.send.await_args_list[0].args[0])
+        self.state.raid.submit_report.assert_awaited_once_with(
+            "https://www.warcraftlogs.com/reports/ReportABC123", refresh=False,
+        )
         self.assertEqual(self.state.analysis_state.report_id, "ReportABC123")
         self.assertFalse(self.bot.import_lock.locked())
         self.assertNotIn("ReportABC123", self.state.importing)
 
     async def test_direct_import_does_not_overlap_an_active_import(self):
-        self.bot.raid.submit_report = AsyncMock()
+        self.state.raid.submit_report = AsyncMock()
         await self.bot.import_lock.acquire()
         try:
             await self.bot.logs_import(
@@ -219,7 +284,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             self.bot.import_lock.release()
-        self.bot.raid.submit_report.assert_not_awaited()
+        self.state.raid.submit_report.assert_not_awaited()
         self.assertIn(
             "Another report is being prepared",
             self.interaction.followup.send.await_args.args[0],
@@ -346,6 +411,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_guild_runtime_state_is_isolated_and_persisted(self):
         other = self.bot.runtime(999)
+        self.assertEqual(self.state.raid.client.guild_id, "10")
+        self.assertEqual(other.raid.client.guild_id, "999")
         self.state.logs_channel_id = 40
         self.state.analysis_state.report_id = "Report123"
         other.channel_id = 21
@@ -406,6 +473,36 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["stop"])
         await self.bot.leave(self.interaction)
         self.assertEqual(calls, ["stop", "stop", "disconnect"])
+        self.fake_session.clear_replay.assert_called_once()
+
+    async def test_replay_requires_recent_audio(self):
+        voice = MagicMock(spec=CarterVoiceClient)
+        voice.is_connected.return_value = True
+        voice.channel = self.channel
+        self.guild.voice_client = voice
+
+        await self.bot.replay(self.interaction)
+
+        voice.play.assert_not_called()
+        self.assertIn(
+            "no recent Carter response",
+            self.interaction.followup.send.await_args.args[0],
+        )
+
+    async def test_replay_plays_cached_audio_without_starting_provider(self):
+        voice = MagicMock(spec=CarterVoiceClient)
+        voice.is_connected.return_value = True
+        voice.channel = self.channel
+        voice.play.side_effect = lambda source: setattr(source, "is_idle", lambda: True)
+        self.guild.voice_client = voice
+        self.fake_session.replay_audio.return_value = b"\x01\x00" * 960
+
+        await self.bot.replay(self.interaction)
+
+        voice.play.assert_called_once()
+        voice.stop.assert_called_once()
+        self.fake_session.start.assert_not_awaited()
+        self.assertFalse(self.state.replay_active)
 
     async def test_wake_rechecks_owner_and_voice_membership(self):
         voice = SimpleNamespace(
@@ -423,12 +520,47 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.state.wake.running = False
         self.state.wake.voice = None
 
+    async def test_completed_exchange_explicitly_rearms_existing_wake_listener(self):
+        voice = SimpleNamespace(
+            channel=self.channel,
+            is_connected=lambda: True,
+        )
+        self.guild.voice_client = voice
+        self.fake_session.voice = voice
+        self.state.want_voice = True
+        self.state.wake.running = True
+        self.state.wake.voice = voice
+        generation = self.state.wake.generation
+
+        await self.bot._rearm_after_exchange(self.state)
+
+        self.assertGreater(self.state.wake.generation, generation)
+        self.assertTrue(self.state.wake.running)
+        self.state.wake.running = False
+        self.state.wake.voice = None
+
+    async def test_completed_exchange_restarts_missing_wake_listener(self):
+        voice = SimpleNamespace(
+            channel=self.channel,
+            is_connected=lambda: True,
+        )
+        self.guild.voice_client = voice
+        self.fake_session.voice = voice
+        self.state.want_voice = True
+        self.state.wake.running = False
+        self.state.wake.settings = WakeSettings(enabled=True, auto_join=False)
+        self.bot._arm_wake = AsyncMock()
+
+        await self.bot._rearm_after_exchange(self.state)
+
+        self.bot._arm_wake.assert_awaited_once_with(self.state, voice)
+
     async def test_voice_tool_posts_matching_image_and_returns_no_bytes(self):
         self.bot.analysis_settings = AnalysisClientSettings(True)
         self.fake_session.owner_id = 30
         image = AnalysisImage(b"png", "death.png", "death position")
         answer = RaidAnswer("Death answer", image, {"text": "Death answer", "image_status": "available"})
-        self.bot.raid.execute_tool = AsyncMock(return_value=answer)
+        self.state.raid.execute_tool = AsyncMock(return_value=answer)
         self.bot._post_voice_analysis = AsyncMock()
         result = await self.bot._voice_analysis_tool(self.state, {
             "name": "query_raid_analysis", "arguments": {"intent": "death"},

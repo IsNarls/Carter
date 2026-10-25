@@ -74,7 +74,29 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(method, "GET")
         self.assertTrue(url.endswith("/reports/AbCdEf123456/fights/7/rankings/dps"))
         self.assertEqual(kwargs["params"], {"limit": 5})
+        self.assertIsNone(kwargs["headers"])
         self.assertFalse(kwargs["allow_redirects"])
+
+    async def test_guild_client_attaches_scope_header_to_every_request(self):
+        session = FakeSession([FakeResponse(200, {"reports": []})])
+        client = AnalysisClient(AnalysisClientSettings(True), session).for_guild(123456789)
+
+        await client.reports()
+
+        self.assertEqual(
+            session.requests[0][2]["headers"], {"X-Carter-Guild-ID": "123456789"},
+        )
+
+    async def test_global_fight_index_uses_guild_scope(self):
+        session = FakeSession([FakeResponse(200, {"fights": []})])
+        client = AnalysisClient(AnalysisClientSettings(True), session).for_guild(123456789)
+
+        await client.all_fights()
+
+        self.assertTrue(session.requests[0][1].endswith("/fights"))
+        self.assertEqual(
+            session.requests[0][2]["headers"], {"X-Carter-Guild-ID": "123456789"},
+        )
 
     async def test_structured_error_is_sanitized(self):
         session = FakeSession([FakeResponse(409, {
@@ -104,7 +126,22 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(url.endswith("/imports"))
         self.assertEqual(kwargs["json"], {
             "report_url": "https://www.warcraftlogs.com/reports/AbCdEf123456",
+            "refresh": False,
         })
+
+    async def test_guild_reset_uses_the_guild_scoped_backend_endpoint(self):
+        session = FakeSession([FakeResponse(200, {"status": "reset"})])
+        client = AnalysisClient(AnalysisClientSettings(True), session).for_guild(123456789)
+
+        await client.reset_import_data()
+
+        method, url, kwargs = session.requests[0]
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/imports/reset"))
+        self.assertEqual(kwargs["json"], {})
+        self.assertEqual(
+            kwargs["headers"], {"X-Carter-Guild-ID": "123456789"},
+        )
 
 
 class ImageTests(unittest.TestCase):
@@ -135,11 +172,29 @@ class ImageTests(unittest.TestCase):
         self.assertTrue(image.data.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertLess(len(image.data), 8 * 1024 * 1024)
 
+    def test_available_gif_is_preferred_over_static_map(self):
+        payload = self.payload()
+        gif = b"GIF89a" + b"focused-animation"
+        payload["animation"] = {
+            "status": "available", "mime_type": "image/gif", "encoding": "base64",
+            "data": base64.b64encode(gif).decode(), "alt_text": "Five seconds to death",
+        }
+        image = render_answer_image(payload)
+        self.assertEqual(image.data, gif)
+        self.assertEqual(image.filename, "carter-death-AbCdEf123456-7.gif")
+        self.assertEqual(image.alt_text, "Five seconds to death")
+
     def test_tool_context_never_contains_base64(self):
         payload = self.payload()
+        payload["animation"] = {
+            "status": "available", "mime_type": "image/gif", "encoding": "base64",
+            "data": base64.b64encode(b"GIF89asecret").decode(), "frames": 26,
+        }
         context = answer_without_image_bytes(payload)
         self.assertEqual(context["text"], "Alex died.")
         self.assertNotIn(payload["image"]["data"], json.dumps(context))
+        self.assertNotIn(payload["animation"]["data"], json.dumps(context))
+        self.assertEqual(context["animation"]["frames"], 26)
 
     def test_doctype_and_bad_base64_are_rejected(self):
         payload = self.payload()

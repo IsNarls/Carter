@@ -385,6 +385,7 @@ class WakeListenerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_session_shares_receiver_and_returns_to_wake_mode(self):
         from types import SimpleNamespace
+        from providers import ProviderEvent
         from session import VoiceSession
         from test_session import FakeProvider, FakeVoice as SessionVoice
 
@@ -407,9 +408,16 @@ class WakeListenerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(session.active)
             self.assertIs(voice.sink, receiver)
             self.assertFalse(session.owns_receiver)
+            await eventually(lambda: provider.ends == 1)
+            sent = len(provider.sent)
             listener.capture(42, AFTER)
-            await eventually(lambda: len(provider.sent) > 1)
-            session.last_activity = time.monotonic() - 46
+            await asyncio.sleep(0.03)
+            self.assertEqual(len(provider.sent), sent)
+            provider.events.put_nowait(ProviderEvent("audio", b"\x01\x00" * 480))
+            provider.events.put_nowait(ProviderEvent("turn_complete"))
+            await eventually(lambda: session.response_complete.is_set())
+            while not session.playback.is_idle():
+                session.playback.read()
             await eventually(lambda: not session.active)
             await eventually(lambda: listener.state == "armed")
             self.assertTrue(voice.connected)

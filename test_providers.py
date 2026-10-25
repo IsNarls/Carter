@@ -123,13 +123,23 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             aclose=AsyncMock(),
         ))
         modules = (SimpleNamespace(Client=Mock(return_value=client)), types)
-        with patch("providers._gemini_modules", return_value=modules):
+        with patch("providers._gemini_modules", return_value=modules), \
+                self.assertLogs("carter.providers", level="INFO") as captured:
             answer = await generate_text(self.settings, "private prompt")
         self.assertEqual(answer, "Carter reply")
         call = client.aio.models.generate_content.await_args.kwargs
         self.assertEqual(call["model"], self.settings.gemini_text_model)
         self.assertEqual(call["contents"], "private prompt")
         self.assertEqual(call["config"]["system_instruction"], self.settings.instructions)
+        self.assertEqual(call["config"]["thinking_config"], {
+            "thinking_level": "minimal",
+        })
+        diagnostics = "\n".join(captured.output)
+        self.assertIn(self.settings.gemini_text_model, diagnostics)
+        self.assertIn("request completed", diagnostics)
+        self.assertNotIn("private prompt", diagnostics)
+        self.assertNotIn("private-gemini", diagnostics)
+        self.assertNotIn("Carter reply", diagnostics)
         client.aio.aclose.assert_awaited_once()
 
     async def test_gemini_text_empty_response_is_sanitized(self):
@@ -157,12 +167,14 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         ))
         modules = (SimpleNamespace(Client=Mock(return_value=client)), types)
         with patch("providers._gemini_modules", return_value=modules), \
-                patch("providers.asyncio.sleep", AsyncMock()) as sleep:
+                patch("providers.asyncio.sleep", AsyncMock()) as sleep, \
+                self.assertLogs("carter.providers", level="WARNING") as captured:
             answer = await generate_text(self.settings, "prompt")
         self.assertEqual(answer, "Recovered reply")
         self.assertEqual(generate.await_count, 2)
         self.assertEqual(client.aio.aclose.await_count, 2)
         sleep.assert_awaited_once_with(1)
+        self.assertNotIn("private upstream detail", "\n".join(captured.output))
 
     async def test_gemini_receives_multiple_turns_and_interruption(self):
         session, _, _, modules = self.gemini_transport()

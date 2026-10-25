@@ -7,17 +7,20 @@ import threading
 import unittest
 from pathlib import Path
 from urllib.parse import quote
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 if __package__:
     from .analysis_api import create_server
     from .analysis_service import AnalysisService, ServiceError
-    from .live_log_service import LiveLogService, LIVE_ACCESS_TOKEN_FILENAME
+    from .live_log_service import (LIVE_ACCESS_TOKEN_FILENAME, LiveLogService,
+                                   ensure_live_access_token)
     from .mechanic_timeline import MechanicScriptRegistry
 else:
     from analysis_api import create_server
     from analysis_service import AnalysisService, ServiceError
-    from live_log_service import LiveLogService, LIVE_ACCESS_TOKEN_FILENAME
+    from live_log_service import (LIVE_ACCESS_TOKEN_FILENAME, LiveLogService,
+                                  ensure_live_access_token)
     from mechanic_timeline import MechanicScriptRegistry
 
 
@@ -56,6 +59,13 @@ HEAL = spell('03.500', 'Player-1', 'Hero', 'Player-1', 'Hero', 40, 'Heal',
              50, 500, 25, 2, 2, 7, 'SPELL_HEAL')
 DEBUFF = line('03.750', ['SPELL_AURA_APPLIED', 'Creature-1', 'Test Boss', 0, 0,
                         'Player-1', 'Hero', 0, 0, 41, 'Doom', 1, 'DEBUFF'])
+GUILD_ID = '123456789'
+
+
+def guild_request(url, *, data=None, method=None, headers=None):
+    scoped = dict(headers or {})
+    scoped['X-Carter-Guild-ID'] = GUILD_ID
+    return Request(url, data=data, headers=scoped, method=method)
 
 
 class LiveLogTests(unittest.TestCase):
@@ -114,12 +124,12 @@ class LiveLogTests(unittest.TestCase):
         live = LiveLogService(self.log, self.root, from_end=False,
                               mechanic_registry=registry)
         service = AnalysisService(self.root, live=live)
-        server = create_server(self.root, port=0, live=live)
+        server = create_server(self.root, port=0, live=live, live_guild_id=GUILD_ID)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             base = f'http://127.0.0.1:{server.server_port}/api/v1/live/timer-module'
-            request = Request(
+            request = guild_request(
                 base + '/arm', data=json.dumps({'encounter_id': 1, 'difficulty': 15}).encode(),
                 headers={'Content-Type': 'application/json'}, method='POST')
             with urlopen(request) as response:
@@ -130,7 +140,7 @@ class LiveLogTests(unittest.TestCase):
             timeline = service.get_live_timeline()
             self.assertEqual(timeline['script_id'], 'heroic-boss')
             self.assertEqual(timeline['events'][0]['difficulty'], 15)
-            with urlopen(Request(base + '/disarm', data=b'{}', method='POST')) as response:
+            with urlopen(guild_request(base + '/disarm', data=b'{}', method='POST')) as response:
                 disarmed = json.load(response)
             self.assertIsNone(disarmed['armed_script_id'])
         finally:
@@ -159,14 +169,16 @@ class LiveLogTests(unittest.TestCase):
         replay = self.service.get_live_death_replay(deaths[0]['death_id'])
         self.assertLessEqual(replay['end'] - replay['start'], 5)
         self.assertEqual(replay['actors']['Player-1'][-1]['x'], 3)
-        server = create_server(self.root, port=0, live=self.live)
+        server = create_server(
+            self.root, port=0, live=self.live, live_guild_id=GUILD_ID,
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             base = f'http://127.0.0.1:{server.server_port}/api/v1/live/rankings'
-            with urlopen(base + '/dps') as response:
+            with urlopen(guild_request(base + '/dps')) as response:
                 self.assertEqual(json.load(response)['metric'], 'dps')
-            with urlopen(base + '/hps') as response:
+            with urlopen(guild_request(base + '/hps')) as response:
                 self.assertEqual(json.load(response)['metric'], 'hps')
         finally:
             server.shutdown()
@@ -240,27 +252,29 @@ class LiveLogTests(unittest.TestCase):
         self.assertEqual(self.service.list_live_attempt_deaths(1)['deaths'][0]['death_id'],
                          death_id)
 
-        server = create_server(self.root, port=0, live=self.live)
+        server = create_server(
+            self.root, port=0, live=self.live, live_guild_id=GUILD_ID,
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base = f'http://127.0.0.1:{server.server_port}/api/v1/live/attempts/1'
         try:
-            with urlopen(base + '/summary') as response:
+            with urlopen(guild_request(base + '/summary')) as response:
                 self.assertEqual(json.load(response)['attempt'], 1)
-            with urlopen(base + '/players?query=hero') as response:
+            with urlopen(guild_request(base + '/players?query=hero')) as response:
                 self.assertEqual(json.load(response)['players'][0]['name'], 'Hero')
-            with urlopen(base + '/players/Player-1') as response:
+            with urlopen(guild_request(base + '/players/Player-1')) as response:
                 self.assertEqual(json.load(response)['player']['name'], 'Hero')
-            with urlopen(base + '/rankings/dps') as response:
+            with urlopen(guild_request(base + '/rankings/dps')) as response:
                 self.assertEqual(json.load(response)['metric'], 'dps')
-            with urlopen(base + '/rankings/hps') as response:
+            with urlopen(guild_request(base + '/rankings/hps')) as response:
                 self.assertEqual(json.load(response)['metric'], 'hps')
-            with urlopen(base + '/deaths') as response:
+            with urlopen(guild_request(base + '/deaths')) as response:
                 self.assertEqual(json.load(response)['deaths'][0]['death_id'], death_id)
             death_path = base + '/deaths/' + quote(death_id, safe='')
-            with urlopen(death_path) as response:
+            with urlopen(guild_request(death_path)) as response:
                 self.assertEqual(json.load(response)['attempt'], 1)
-            with urlopen(death_path + '/answer') as response:
+            with urlopen(guild_request(death_path + '/answer')) as response:
                 api_answer = json.load(response)
             self.assertEqual(api_answer['death_id'], death_id)
             self.assertEqual(api_answer['analysis']['attempt'], 1)
@@ -305,12 +319,14 @@ class LiveLogTests(unittest.TestCase):
         self.log.write_text('', encoding='utf-8')
         self.live.scan_once()
         self.assertEqual(self.live.status()['encounter_state'], 'idle')
-        server = create_server(self.root, port=0, live=self.live)
+        server = create_server(
+            self.root, port=0, live=self.live, live_guild_id=GUILD_ID,
+        )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             base = f'http://127.0.0.1:{server.server_port}/api/v1/live'
-            with urlopen(base + '/status') as response:
+            with urlopen(guild_request(base + '/status')) as response:
                 payload = json.load(response)
             self.assertEqual(payload['source_name'], 'WoWCombatLog.txt')
             self.assertNotIn(str(self.root), json.dumps(payload))
@@ -337,6 +353,76 @@ class LiveLogTests(unittest.TestCase):
         with self.assertRaises(ServiceError) as raised:
             self.service.get_live_updates(0)
         self.assertEqual(raised.exception.code, 'CURSOR_EXPIRED')
+
+    def test_remote_ingest_requires_guild_token_and_deduplicates_retry(self):
+        server = create_server(self.root, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}/api/v1/live/ingest'
+            headers = {
+                'Content-Type': 'application/octet-stream',
+                'X-Carter-Live-Stream-ID': 'test-stream-001',
+                'X-Carter-Live-Offset': '0',
+            }
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(guild_request(url, data=START.encode(), method='POST', headers=headers))
+            self.assertEqual(raised.exception.code, 401)
+
+            guild_storage = self.root / 'guilds' / GUILD_ID
+            self.assertFalse(guild_storage.exists())
+            token_path = ensure_live_access_token(guild_storage)['path']
+            token = token_path.read_text(encoding='ascii').strip()
+            headers['X-Carter-Live-Token'] = token
+            data = (START + BOSS_HIT + END).encode()
+            with urlopen(guild_request(url, data=data, method='POST', headers=headers)) as response:
+                accepted = json.load(response)
+            self.assertEqual(accepted['accepted'], 3)
+            self.assertFalse(accepted['duplicate'])
+            with urlopen(guild_request(url, data=data, method='POST', headers=headers)) as response:
+                duplicate = json.load(response)
+            self.assertTrue(duplicate['duplicate'])
+            self.assertEqual(duplicate['accepted'], 0)
+
+            status_url = f'http://127.0.0.1:{server.server_port}/api/v1/live/status'
+            with urlopen(guild_request(status_url)) as response:
+                status = json.load(response)
+            self.assertEqual(status['source_type'], 'remote_live_log')
+            self.assertEqual(status['encounter_state'], 'completed')
+            self.assertNotIn(token, json.dumps(status))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_remote_ingest_recovers_an_active_pull_after_backend_restart(self):
+        storage = self.root / 'remote-restart'
+        first = LiveLogService(None, storage, remote=True, rebuild_interval=.01)
+        opening = (START + BOSS_HIT).encode()
+        first.ingest_remote_batch('restart-stream-001', 0, opening)
+        self.assertEqual(first.status()['encounter_state'], 'active')
+
+        first.stop()
+        resumed = LiveLogService(None, storage, remote=True, rebuild_interval=.01)
+        try:
+            self.assertEqual(resumed.status()['encounter_state'], 'active')
+            result = resumed.ingest_remote_batch(
+                'restart-stream-001', len(opening), (BIG_HIT + END).encode(),
+            )
+            self.assertEqual(result['accepted'], 2)
+            self.assertEqual(resumed.status()['encounter_state'], 'completed')
+            attempts = AnalysisService(storage, live=resumed).list_live_attempts()['attempts']
+            self.assertEqual([item['attempt'] for item in attempts], [1])
+        finally:
+            resumed.stop()
+
+        restored = LiveLogService(None, storage, remote=True)
+        try:
+            attempts = AnalysisService(storage, live=restored).list_live_attempts()['attempts']
+            self.assertEqual([item['attempt'] for item in attempts], [1])
+            self.assertEqual(restored.status()['encounter_state'], 'completed')
+        finally:
+            restored.stop()
 
 
 if __name__ == '__main__':

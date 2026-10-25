@@ -58,6 +58,11 @@ class PCMPlayback(discord.AudioSource):
                 self.frames.append(self.pending.ljust(self.FRAME, b"\0"))
                 self.pending = b""
 
+    def is_idle(self):
+        """Return whether every queued byte for the completed turn was read."""
+        with self.lock:
+            return not self.frames and not self.pending
+
     def read(self):
         with self.lock:
             if self.closed:

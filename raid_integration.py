@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -105,14 +107,15 @@ class RaidAnalysis:
         available = fights.get("fights") if isinstance(fights.get("fights"), list) else []
         if not available:
             raise AnalysisClientError("fight_not_found")
-        latest = max(available, key=lambda item: int(item.get("attempt") or 0))
+        latest = max(available, key=_fight_time_key)
         state.source = "stored"
         state.report_id = str(fights.get("report_id") or report_id)
         state.fight_id = int(latest["fight_id"])
         state.live_attempt = None
+        label = _result_slot_label(latest, available)
         return RaidAnswer(
-            f"Selected report `{state.report_id}`, fight {state.fight_id}: "
-            f"{_clean(latest.get('name'), 100)} ({_result(latest)})."
+            f"Selected report `{state.report_id}`: {_clean(latest.get('name'), 100)} — "
+            f"{label}."
         )
 
     async def select_fight(self, state: GuildAnalysisState, fight_id: int):
@@ -124,9 +127,9 @@ class RaidAnalysis:
         if not match:
             raise AnalysisClientError("fight_not_found")
         state.source, state.fight_id, state.live_attempt = "stored", int(fight_id), None
+        label = _result_slot_label(match, fights.get("fights", []))
         return RaidAnswer(
-            f"Selected fight {state.fight_id}: {_clean(match.get('name'), 100)} "
-            f"({_result(match)})."
+            f"Selected {_clean(match.get('name'), 100)} — {label}."
         )
 
     async def select_live(self, state: GuildAnalysisState, attempt: int | None = None):
@@ -160,22 +163,73 @@ class RaidAnalysis:
             )
         return RaidAnswer("\n".join(lines))
 
+    async def bosses(self, limit: int = 25):
+        """List unique prepared bosses by their newest stored encounter timestamp."""
+        payload = await self.client.all_fights()
+        fights = payload.get("fights") if isinstance(payload.get("fights"), list) else []
+        grouped = {}
+        for fight in fights:
+            name = _clean(fight.get("name"), 80)
+            key = _normalized_words(name)
+            if not key:
+                continue
+            current = grouped.get(key)
+            if current is None:
+                current = {"name": name, "fights": 0, "kills": 0, "reports": set(),
+                           "latest": fight}
+                grouped[key] = current
+            current["fights"] += 1
+            current["kills"] += int(fight.get("kill") is True)
+            if fight.get("report_id"):
+                current["reports"].add(str(fight["report_id"]))
+            if _fight_time_key(fight) > _fight_time_key(current["latest"]):
+                current["latest"] = fight
+        bosses = sorted(grouped.values(), key=lambda item: _fight_time_key(item["latest"]),
+                        reverse=True)
+        if not bosses:
+            return RaidAnswer("The analysis backend has no prepared boss fights yet.")
+        applied = max(1, min(int(limit), 25))
+        lines = ["**Prepared bosses — newest encounter first**"]
+        context = []
+        for boss in bosses[:applied]:
+            latest = boss["latest"]
+            lines.append(
+                f"• {boss['name']} — {_fight_date(latest)} — {boss['fights']} pull(s), "
+                f"{boss['kills']} kill(s), {len(boss['reports'])} report(s)"
+            )
+            context.append({
+                "name": boss["name"], "latest_time_ms": latest.get("start_time_ms"),
+                "pulls": boss["fights"], "kills": boss["kills"],
+                "report_count": len(boss["reports"]),
+            })
+        if len(bosses) > applied:
+            lines.append(f"{len(bosses) - applied} additional boss(es) are not shown.")
+        return RaidAnswer("\n".join(lines), tool_context={
+            "intent": "bosses", "bosses": context, "truncated": len(bosses) > applied,
+        })
+
     async def fights(self, state: GuildAnalysisState, report_id: str | None = None,
                      limit: int = 20):
-        report_id = report_id or state.report_id
-        if not report_id:
-            source = await self._stored_source(state, "latest")
-            report_id = source.report_id
-        payload = await self.client.fights(report_id)
+        payload = (await self.client.fights(report_id) if report_id
+                   else await self.client.all_fights())
         fights = payload.get("fights") if isinstance(payload.get("fights"), list) else []
+        history_payload = await self.client.all_fights() if report_id else payload
+        history = (history_payload.get("fights")
+                   if isinstance(history_payload.get("fights"), list) else fights)
         if not fights:
-            return RaidAnswer(f"Report `{report_id}` contains no boss fights.")
-        lines = [f"**Fights in `{report_id}`**"]
-        for fight in fights[-max(1, min(int(limit), 25)):]:
+            return RaidAnswer(
+                f"Report `{report_id}` contains no boss fights." if report_id
+                else "The analysis backend has no prepared fights yet."
+            )
+        fights = sorted(fights, key=_fight_time_key, reverse=True)
+        lines = ([f"**Fights in `{report_id}` — newest first**"] if report_id else
+                 ["**Prepared fights — newest first**"])
+        for fight in fights[:max(1, min(int(limit), 25))]:
             duration = _duration(fight.get("duration_seconds"))
+            source = f"`{fight.get('report_id')}` · " if not report_id else ""
             lines.append(
-                f"• Fight {fight.get('fight_id')} — {_clean(fight.get('name'), 80)} — "
-                f"{_result(fight)}, {duration}"
+                f"• {_fight_date(fight)} — {source}{_clean(fight.get('name'), 80)} — "
+                f"{_result_slot_label(fight, history)}, {duration}"
             )
         return RaidAnswer("\n".join(lines))
 
@@ -299,24 +353,35 @@ class RaidAnalysis:
             text += f"\nWarcraft Logs: {source_url}"
         return RaidAnswer(text, image=image, tool_context={"intent": "death", **context})
 
-    async def death_timeline(self, state: GuildAnalysisState, question: str = ""):
-        """List bounded, fight-relative death timestamps without choosing a victim."""
+    async def death_timeline(self, state: GuildAnalysisState, question: str = "",
+                             player_name: str | None = None):
+        """List bounded death timestamps and map the latest listed player death."""
         source = await self.resolve_source(state, question)
+        player_name = str(player_name or _named_player(question) or "").strip() or None
         if source.kind == "stored":
-            payload = await self.client.deaths(source.report_id, source.fight_id)
+            payload = await self.client.deaths(
+                source.report_id, source.fight_id, player_name=player_name,
+            ) if player_name else await self.client.deaths(source.report_id, source.fight_id)
         elif source.attempt is not None:
-            payload = await self.client.archived_deaths(source.attempt)
+            payload = await self.client.archived_deaths(
+                source.attempt, player_name=player_name,
+            ) if player_name else await self.client.archived_deaths(source.attempt)
         else:
-            payload = await self.client.live_deaths()
+            payload = await self.client.live_deaths(
+                player_name=player_name,
+            ) if player_name else await self.client.live_deaths()
         deaths = payload.get("deaths") if isinstance(payload.get("deaths"), list) else []
         ordered = sorted(
             deaths,
             key=lambda item: (float(item.get("time_seconds") or 0), str(item.get("death_id") or "")),
         )
         if not ordered:
-            return RaidAnswer(f"No player deaths were recorded for {source.label}.")
-        lines = [f"**Death timeline — {source.label}**"]
-        for item in ordered[:50]:
+            subject = f" for {_clean(player_name, 80)}" if player_name else ""
+            return RaidAnswer(f"No player deaths{subject} were recorded for {source.label}.")
+        shown = ordered[:50]
+        subject = f" for {_clean(player_name, 80)}" if player_name else ""
+        lines = [f"**Death timeline{subject} — {source.label}**"]
+        for item in shown:
             killing = item.get("killing_blow") if isinstance(item.get("killing_blow"), dict) else {}
             cause = _clean(killing.get("ability"), 80) if killing.get("ability") else "unknown cause"
             lines.append(
@@ -326,30 +391,76 @@ class RaidAnalysis:
             )
         if len(ordered) > 50 or payload.get("truncated"):
             lines.append("Additional deaths were truncated by the bounded analysis response.")
+        image = None
+        mapped_context = None
+        if player_name:
+            selected = shown[-1]
+            if source.kind == "stored":
+                map_payload = await self.client.death_answer(
+                    source.report_id, source.fight_id, selected["death_id"],
+                )
+            elif source.attempt is not None:
+                map_payload = await self.client.archived_death_answer(
+                    source.attempt, selected["death_id"],
+                )
+            else:
+                map_payload = await self.client.live_death_answer(selected["death_id"])
+            mapped_context = answer_without_image_bytes(map_payload)
+            image_error = None
+            try:
+                image = render_answer_image(map_payload)
+            except AnalysisClientError as error:
+                if error.code not in {
+                    "unsupported_image", "invalid_image", "image_renderer_unavailable",
+                    "image_render_failed",
+                }:
+                    raise
+                image_error = error.code
+            mapped_time = float(selected.get("time_seconds") or 0)
+            if image:
+                attachment = ("5-second focused position replay"
+                              if image.filename.endswith(".gif") else "2D position map")
+                lines.append(
+                    f"Attached {attachment}: latest listed death for "
+                    f"{_clean(player_name, 80)} at {mapped_time:.2f}s."
+                )
+            else:
+                image_payload = (map_payload.get("image")
+                                 if isinstance(map_payload.get("image"), dict) else {})
+                reason = image_payload.get("reason") or image_error or "not available"
+                lines.append(
+                    f"2D position map unavailable for the latest listed death "
+                    f"({_clean(reason, 180)})."
+                )
         source_url = _source_url(source)
         if source_url:
             lines.append(f"Warcraft Logs: {source_url}")
-        return RaidAnswer("\n".join(lines), tool_context={
+        context = {
             "intent": "death_timeline",
             "source": source.label,
+            "player_name": player_name,
             "deaths": [{
                 "death_id": item.get("death_id"),
                 "player_name": item.get("player_name"),
                 "death_number": item.get("death_number"),
                 "time_seconds": item.get("time_seconds"),
                 "killing_blow": item.get("killing_blow"),
-            } for item in ordered[:50]],
+            } for item in shown],
             "truncated": bool(len(ordered) > 50 or payload.get("truncated")),
-        })
+        }
+        if mapped_context is not None:
+            context["mapped_death"] = mapped_context
+        return RaidAnswer("\n".join(lines), image=image, tool_context=context)
 
-    async def submit_report(self, report_url: str):
-        payload = await self.client.import_report(report_url)
+    async def submit_report(self, report_url: str, *, refresh: bool = False):
+        payload = await self.client.import_report(report_url, refresh=refresh)
         job = str(payload.get("job_id") or "")
         code = str(payload.get("report_id") or "")
         if not job:
             raise AnalysisClientError("invalid_import_response")
         return RaidAnswer(
-            f"Queued report `{code or 'unknown'}` for backend retrieval and analysis "
+            f"Queued report `{code or 'unknown'}` for backend "
+            f"{'refresh' if refresh else 'cache check and analysis'} "
             f"(job `{job}`).",
             tool_context={"intent": "import", "job_id": job, "report_id": code},
         )
@@ -360,9 +471,15 @@ class RaidAnalysis:
         url = REPORT_URL.search(text)
         if url and re.search(r"\b(import|download|analy[sz]e|load|prepare)\b", lowered):
             return await self.submit_report(url.group(0))
+        if (re.search(r"\b(?:which|what|list|show)\b.*\bboss(?:es)?\b", lowered)
+                or re.search(r"\bboss(?:es)?\b.*\b(?:data|logs?|available|stored)\b", lowered)):
+            return await self.bosses()
+        if re.search(r"\b(?:have|any|show|find|check)\b.*\b(?:data|logs?)\s+(?:on|for)\b",
+                     lowered):
+            return await self.summary(state, text)
         if (re.search(r"\b(death timeline|deaths|who died)\b", lowered)
                 or re.search(r"\b(?:death breakdown|breakdown (?:of )?deaths?)\b", lowered)):
-            return await self.death_timeline(state, text)
+            return await self.death_timeline(state, text, _named_player(text))
         if re.search(r"\b(die|died|death|killed|killing blow)\b", lowered):
             player = self._question_player(state, text, user_id)
             number = _death_number(lowered)
@@ -403,6 +520,8 @@ class RaidAnalysis:
             await self.select_live(working, int(arguments["attempt"]))
         if intent == "summary":
             answer = await self.summary(working, question)
+        elif intent == "bosses":
+            answer = await self.bosses(int(arguments.get("limit") or 25))
         elif intent in {"damage_ranking", "dps"}:
             answer = await self.ranking(
                 working, "dps", int(arguments.get("limit") or 5), question,
@@ -419,7 +538,9 @@ class RaidAnalysis:
             number = _positive_or_none(arguments.get("death_number"))
             answer = await self.death(working, name, number, question)
         elif intent == "death_timeline":
-            answer = await self.death_timeline(working, question)
+            supplied = str(arguments.get("player_name") or "").strip()
+            name = self._argument_player(working, supplied, user_id) if supplied else None
+            answer = await self.death_timeline(working, question, name)
         else:
             raise AnalysisClientError("unsupported_analysis_intent")
         state.source = working.source
@@ -439,8 +560,11 @@ class RaidAnalysis:
                 if not attempts:
                     raise AnalysisClientError("fight_not_found")
                 candidates = _named_encounters(attempts, lowered)
+                if candidates is attempts and _requests_named_encounter(lowered):
+                    raise AnalysisClientError("fight_not_found")
                 if "wipe" in lowered:
-                    candidates = [item for item in candidates if _live_attempt_result(item) == "wipe"]
+                    candidates = [item for item in candidates
+                                  if _live_attempt_result(item) == "wipe"]
                 elif re.search(r"\bkill\b", lowered):
                     candidates = [item for item in candidates if _live_attempt_result(item) == "kill"]
                 selected = _temporal_encounter(
@@ -454,38 +578,89 @@ class RaidAnalysis:
         return await self._stored_source(state, question)
 
     async def _stored_source(self, state: GuildAnalysisState, question: str):
-        report_id = state.report_id
-        if not report_id:
-            payload = await self.client.reports()
-            reports = payload.get("reports") if isinstance(payload.get("reports"), list) else []
-            if not reports:
-                raise AnalysisClientError("report_not_found")
-            report_id = str(reports[0].get("report_id") or "")
-            state.report_id = report_id
-        payload = await self.client.fights(report_id)
+        payload = await self.client.all_fights()
         fights = payload.get("fights") if isinstance(payload.get("fights"), list) else []
         if not fights:
             raise AnalysisClientError("fight_not_found")
+        fights = sorted(fights, key=_fight_time_key)
+        report_id = state.report_id
         fight_id = state.fight_id
         lowered = question.casefold()
         named = _named_encounters(fights, lowered)
+        if named is fights and _requests_named_encounter(lowered):
+            raise AnalysisClientError("fight_not_found")
+        requested_fight = _requested_fight_id(lowered)
+        requested_result = _requested_result_slot(lowered)
         temporal = re.search(r"\b(latest|newest|last|previous|prior)\b", lowered)
-        if fight_id is None or temporal or named is not fights:
+        selected = next((item for item in fights
+                         if str(item.get("report_id") or "") == str(report_id or "")
+                         and int(item.get("fight_id") or 0) == int(fight_id or 0)), None)
+        if (selected is None or temporal or named is not fights or requested_fight is not None
+                or requested_result is not None):
             candidates = named
+            if requested_result is not None:
+                result_name, occurrence, stated_total = requested_result
+                requested_difficulty = _requested_difficulty(lowered)
+                historical_candidates = [
+                    item for item in candidates
+                    if ((result_name == "kill" and item.get("kill") is True)
+                        or (result_name == "wipe" and item.get("kill") is False))
+                    and (requested_difficulty is None
+                         or int(item.get("difficulty") or 0) == requested_difficulty)
+                ]
+                if named is fights and historical_candidates:
+                    newest = max(historical_candidates, key=_fight_time_key)
+                    encounter = _normalized_words(newest.get("name"))
+                    difficulty = int(newest.get("difficulty") or 0)
+                    historical_candidates = [
+                        item for item in historical_candidates
+                        if _normalized_words(item.get("name")) == encounter
+                        and int(item.get("difficulty") or 0) == difficulty
+                    ]
+                historical_candidates = _deduplicated_pulls(historical_candidates)
+                if (occurrence < 1 or occurrence > len(historical_candidates)
+                        or (stated_total is not None
+                            and stated_total != len(historical_candidates))):
+                    raise AnalysisClientError("fight_not_found")
+                candidates = [historical_candidates[occurrence - 1]]
+            if requested_fight is not None:
+                candidates = [item for item in candidates
+                              if int(item.get("fight_id") or 0) == requested_fight]
+                candidate_reports = {str(item.get("report_id") or "") for item in candidates}
+                if candidate_reports:
+                    newest_report = max(
+                        candidate_reports,
+                        key=lambda candidate: max(
+                            (_fight_time_key(item) for item in fights
+                             if str(item.get("report_id") or "") == candidate),
+                            default=(0, 0, 0),
+                        ),
+                    )
+                    candidates = [item for item in candidates
+                                  if str(item.get("report_id") or "") == newest_report]
             if "wipe" in lowered:
                 candidates = [item for item in candidates if item.get("kill") is False]
             elif re.search(r"\bkill\b", lowered):
                 candidates = [item for item in candidates if item.get("kill") is True]
+            difficulty = _requested_difficulty(lowered)
+            if difficulty is not None:
+                candidates = [item for item in candidates
+                              if int(item.get("difficulty") or 0) == difficulty]
             selected = _temporal_encounter(
-                candidates, lowered, "attempt", current_id=fight_id,
+                candidates, lowered, "start_time_ms", current_id=fight_id,
                 identity_key="fight_id",
             )
             fight_id = int(selected["fight_id"])
+            report_id = str(selected.get("report_id") or "")
+            state.report_id = report_id
             state.fight_id = fight_id
-        selected = next((item for item in fights if int(item.get("fight_id") or 0) == fight_id), None)
         if selected is None:
             raise AnalysisClientError("fight_not_found")
-        label = f"{_clean(selected.get('name'), 80)}, report {report_id}, fight {fight_id}"
+        difficulty_label = _difficulty_name(selected.get("difficulty"))
+        result_label = _result_slot_label(selected, fights)
+        label = (f"{_clean(selected.get('name'), 80)}{difficulty_label}, "
+                 f"{_fight_date(selected)}, "
+                 f"{result_label}, report {report_id}")
         return ResolvedSource("stored", report_id, fight_id, label=label)
 
     @staticmethod
@@ -513,14 +688,15 @@ def analysis_tool_declaration():
         "name": "query_raid_analysis",
         "description": (
             "Query Carter's prepared raid-log backend. Use for encounter summaries, DPS or HPS "
-            "rankings, player performance, and death explanations. Never invent unavailable data."
+            "rankings, stored boss lists, player performance, and death explanations. Never "
+            "invent unavailable data."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "intent": {"type": "STRING", "enum": [
-                    "summary", "damage_ranking", "healing_ranking", "player", "death",
-                    "death_timeline",
+                    "summary", "bosses", "damage_ranking", "healing_ranking", "player",
+                    "death", "death_timeline",
                 ]},
                 "question": {"type": "STRING"},
                 "source": {"type": "STRING", "enum": ["stored", "live"]},
@@ -557,6 +733,10 @@ def user_error(error: AnalysisClientError) -> str:
         "live_source_not_configured": "The backend has no live combat-log source configured.",
         "NO_ACTIVE_ENCOUNTER": "There is no active live encounter.",
         "image_renderer_unavailable": "The explanation is available, but PNG rendering is not installed.",
+        "RATE_LIMITED": (
+            "Warcraft Logs reached its API limit. Downloaded pages were saved; retry the import "
+            "later to resume from the checkpoint."
+        ),
     }
     return messages.get(error.code, f"Raid analysis could not complete the request ({error.code}).")
 
@@ -591,6 +771,8 @@ def _one_death(deaths, number):
 
 def _named_player(text):
     patterns = (
+        r"\bdeaths?\s+(?:for|of)\s+(?:player\s*:?\s*)?([^\W\d_][\w'’.-]{1,39})",
+        r"\bplayer\s*:\s*([^\W\d_][\w'’.-]{1,39})",
         r"\bwhy did\s+([\w'’.-]{2,40})\s+(?:die|get killed)",
         r"\b(?:dps|damage|healing|hps|performance)\s+(?:for|of|by)\s+([\w'’.-]{2,40})",
         r"\bhow did\s+([\w'’.-]{2,40})\s+(?:do|perform)",
@@ -636,6 +818,24 @@ def _duration(value):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def _fight_time_key(item):
+    """Use absolute encounter time, with report-local attempt only as a legacy fallback."""
+    absolute = int(item.get("start_time_ms") or 0)
+    return absolute, int(item.get("attempt") or 0), int(item.get("fight_id") or 0)
+
+
+def _fight_date(item):
+    try:
+        milliseconds = int(item.get("start_time_ms") or 0)
+        if milliseconds <= 0:
+            raise ValueError
+        return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+    except (OverflowError, TypeError, ValueError):
+        return "time unavailable"
+
+
 def _result(payload):
     if payload.get("kill") is True or str(payload.get("result") or "").upper() == "KILL":
         return "kill"
@@ -662,12 +862,20 @@ def _source_url(source):
 
 
 def _normalized_words(value):
-    return " ".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
+    value = str(value).casefold().replace("'", "").replace("’", "")
+    return " ".join(re.findall(r"[a-z0-9]+", value))
 
 
 def _named_encounters(items, question):
-    """Filter when a complete encounter name (optionally without leading 'The') is present."""
+    """Filter by exact or conservative typo-tolerant encounter-name matching."""
     normalized_question = _normalized_words(question)
+    unique_names = {_normalized_words(item.get("name")) for item in items}
+    aliases = {}
+    for name in unique_names:
+        words = name.split()
+        if words and len(words[0]) >= 5 and words[0] != "the":
+            aliases.setdefault(words[0], set()).add(name)
+    unique_aliases = {alias for alias, names in aliases.items() if len(names) == 1}
     matches = []
     for item in items:
         name = _normalized_words(item.get("name"))
@@ -677,12 +885,146 @@ def _named_encounters(items, question):
         if name and any(re.search(rf"\b{re.escape(value)}\b", normalized_question)
                         for value in variants if value):
             matches.append(item)
+            continue
+        if any(re.search(rf"\b{re.escape(alias)}\b", normalized_question)
+               for alias in unique_aliases if name in aliases[alias]):
+            matches.append(item)
+            continue
+        question_words = normalized_question.split()
+        for value in variants:
+            name_words = value.split()
+            if not name_words:
+                continue
+            width = len(name_words)
+            phrases = question_words if width == 1 else (
+                [" ".join(question_words[index:index + width])
+                 for index in range(len(question_words) - width + 1)]
+            )
+            target = value.replace(" ", "")
+            if any(_close_encounter_name(candidate.replace(" ", ""), target)
+                   for candidate in phrases):
+                matches.append(item)
+                break
     return matches if matches else items
+
+
+def _close_encounter_name(candidate, target):
+    if min(len(candidate), len(target)) < 5:
+        return False
+    threshold = 0.84 if max(len(candidate), len(target)) < 9 else 0.80
+    return SequenceMatcher(None, candidate, target).ratio() >= threshold
+
+
+def _requests_named_encounter(question):
+    match = re.search(
+        r"\b(?:for|on|from)\s+(.{1,80}?)\s+(?:fight|boss|pull|kill|wipe)\b",
+        question, re.IGNORECASE,
+    )
+    if not match:
+        return False
+    words = _normalized_words(match.group(1)).split()
+    ignored = {"the", "mythic", "heroic", "normal", "last", "latest", "newest",
+               "previous", "prior"}
+    return bool([word for word in words if word not in ignored])
+
+
+def _requested_difficulty(question):
+    for name, value in (("mythic", 5), ("heroic", 4), ("normal", 3)):
+        if re.search(rf"\b{name}\b", question):
+            return value
+    return None
+
+
+def _requested_fight_id(question):
+    match = re.search(r"\bfight\s*#?\s*(\d{1,5})\b", question, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _requested_result_slot(question):
+    match = re.search(r"\b(wipe|kill)\s+(\d{1,3})(?:\s*/\s*(\d{1,3}))?\b",
+                      question, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).casefold(), int(match.group(2)), (
+        int(match.group(3)) if match.group(3) else None
+    )
+
+
+def _result_slot_label(selected, fights):
+    """Return a guild-history Kill/Wipe X/Y label for one boss and difficulty."""
+    if selected.get("kill") not in {True, False}:
+        return "In Progress"
+    killed = selected.get("kill") is True
+    encounter = _normalized_words(selected.get("name"))
+    difficulty = int(selected.get("difficulty") or 0)
+    peers = _deduplicated_pulls([
+        item for item in fights
+        if _normalized_words(item.get("name")) == encounter
+        and int(item.get("difficulty") or 0) == difficulty
+        and item.get("kill") is killed
+    ])
+    report_id = str(selected.get("report_id") or "")
+    identity = (report_id, int(selected.get("fight_id") or 0))
+    index = next(
+        (number for number, item in enumerate(peers, 1)
+         if (str(item.get("report_id") or report_id), int(item.get("fight_id") or 0)) == identity),
+        0,
+    )
+    if not index:
+        selected_time = int(selected.get("start_time_ms") or 0)
+        index = next(
+            (number for number, item in enumerate(peers, 1)
+             if selected_time > 0
+             and abs(int(item.get("start_time_ms") or 0) - selected_time) <= 2000),
+            1,
+        )
+    return f"{'Kill' if killed else 'Wipe'} {index}/{max(1, len(peers))}"
+
+
+def _deduplicated_pulls(items):
+    """Collapse overlapping uploads of the same timestamped pull."""
+    ordered = sorted(items, key=_fight_time_key)
+    groups = []
+    for item in ordered:
+        timestamp = int(item.get("start_time_ms") or 0)
+        duration = float(item.get("duration_seconds") or 0)
+        if groups:
+            previous = groups[-1][-1]
+            previous_time = int(previous.get("start_time_ms") or 0)
+            previous_duration = float(previous.get("duration_seconds") or 0)
+            same_time = timestamp > 0 and previous_time > 0 and abs(timestamp - previous_time) <= 2000
+            same_duration = (not duration or not previous_duration
+                             or abs(duration - previous_duration) <= 2)
+            report_id = str(item.get("report_id") or "")
+            mirrored_report = bool(report_id) and all(
+                str(member.get("report_id") or "") not in {"", report_id}
+                for member in groups[-1]
+            )
+            if mirrored_report and same_time and same_duration:
+                groups[-1].append(item)
+                continue
+        groups.append([item])
+    # Prefer the latest-timestamped copy when two reports contain the same pull.
+    return [max(group, key=_fight_time_key) for group in groups]
+
+
+def _difficulty_name(value):
+    try:
+        name = {3: "Normal", 4: "Heroic", 5: "Mythic"}.get(int(value))
+    except (TypeError, ValueError):
+        name = None
+    return f" ({name})" if name else ""
 
 
 def _temporal_encounter(items, question, order_key, *, current_id=None,
                         identity_key=None):
-    candidates = sorted(items, key=lambda item: int(item.get(order_key) or 0))
+    def order(item):
+        value = int(item.get(order_key) or 0)
+        if order_key == "start_time_ms" and value <= 0:
+            value = int(item.get("attempt") or 0)
+        return value
+
+    candidates = sorted(items, key=order)
     if not candidates:
         raise AnalysisClientError("fight_not_found")
     if re.search(r"\b(previous|prior)\b", question) and current_id is not None:
@@ -690,9 +1032,9 @@ def _temporal_encounter(items, question, order_key, *, current_id=None,
         current = next((item for item in candidates
                         if int(item.get(key) or 0) == int(current_id)), None)
         if current is not None:
-            current_order = int(current.get(order_key) or 0)
+            current_order = order(current)
             earlier = [item for item in candidates
-                       if int(item.get(order_key) or 0) < current_order]
+                       if order(item) < current_order]
             if earlier:
                 return earlier[-1]
             raise AnalysisClientError("fight_not_found")

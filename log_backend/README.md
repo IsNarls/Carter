@@ -16,9 +16,14 @@ interface remains usable while reading large archives.
 When this backend is inside the Carter checkout, the launcher's **Carter
 service** panel can start, stop, and restart Carter. It honors Carter's existing
 single-instance lock, refuses to stop an unverified PID, and writes subprocess
-output to the ignored owner-only `.carter_data/gui-carter.log` file. It does not
-start a second analysis API process; start that service separately before
-Carter.
+output to the ignored owner-only `.carter_data/gui-carter.log` file. Carter
+normally starts, health-checks, and stops its own loopback analysis child, whose
+output is kept in `.carter_data/analysis-backend.log`. A healthy API process
+that was started outside Carter is reused and left running when Carter stops.
+The launcher's copyable **Live diagnostics console** tails the Carter and backend
+files in separate tabs, bounds the displayed history, and redacts common
+credential shapes before display. Clearing a console view does not delete its
+private log file. Carter started from a terminal still writes to that terminal.
 
 The same panel can prepare the live-log access token in the default integrated
 storage directory. Only the token fingerprint is displayed.
@@ -36,16 +41,27 @@ secret. API clients can be created at <https://www.warcraftlogs.com/api/clients/
 Credentials are held only for the current download and are never included in
 the report caches.
 
-For reusable credentials, edit the blank `.env` file beside the scripts:
+For reusable credentials, edit the repository-root Carter `.env` one directory above this backend:
 
 ```dotenv
-WARCRAFT_LOGS_CLIENT_ID=your_client_id
-WARCRAFT_LOGS_CLIENT_SECRET=your_client_secret
+CARTER_WARCRAFT_LOGS_CLIENT_ID=your_client_id
+CARTER_WARCRAFT_LOGS_CLIENT_SECRET=your_client_secret
 ```
 
-The GUI reads this file when the import window opens. Process environment
-variables with the same names take precedence. `.env` and downloaded
-`*.wcl.json` caches are excluded by the included `.gitignore`.
+The GUI and API importer read that root file when an import begins. Standard
+process variables named `WARCRAFT_LOGS_CLIENT_ID` and
+`WARCRAFT_LOGS_CLIENT_SECRET` take precedence. The root `.env` and downloaded
+`*.wcl.json` caches are excluded by the included ignore rules.
+
+To trace slow or repeated API pagination requests, set
+`WARCRAFT_LOGS_DOWNLOAD_DEBUG=1` before starting the application. Each page writes
+its report/fight, page number, requested cursor, event counts, and request
+duration to stderr and, during GUI imports, to the **Warcraft Logs** tab in the
+live diagnostics console. Imports queued through Discord's `/logs ingest` also
+appear there, sourced from the analysis-backend log. The console shows an
+indeterminate bar during configuration/download and encounter-based percentage
+progress during analysis. The trace is disabled by default and does not include
+credentials or event payloads.
 
 When an imported cache is selected in the timeline window, choose **Rescan WCL
 report** to download every fight again and refresh the encounter list. The cache
@@ -69,13 +85,23 @@ raw cache, credentials, or `.env` content. Analyze a fight once in the desktop
 application before querying it; a missing result returns `ANALYSIS_REQUIRED`
 without parsing the large report during the request.
 
-Start the localhost server:
+Except for `GET /health`, every HTTP request must include
+`X-Carter-Guild-ID` with a positive Discord guild ID. The server resolves that
+scope to `STORAGE/guilds/GUILD_ID/`; reports, import jobs, five-report retention,
+analysis sidecars, mechanic drafts, and live data are isolated by guild. The
+header is a local routing scope, not internet-facing authentication, so keep the
+API on loopback or behind the protected transport described by Carter's main
+README.
+
+For standalone backend development, start the localhost server directly:
 
 ```powershell
 python analysis_api.py
 ```
 
-The default address is `http://127.0.0.1:8765/api/v1`. A different bind address
+An integrated Carter deployment does not need this separate command when
+`CARTER_ANALYSIS_MANAGE_BACKEND=true`. The default address is
+`http://127.0.0.1:8765/api/v1`. A different bind address
 must be selected explicitly with `--host`; `--port` and `--storage` are also
 available. Query logic is separately available through
 `AnalysisService` in `analysis_service.py`, so another Python application does
@@ -107,12 +133,15 @@ Comparison requests use JSON such as:
 Example calls:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8765/api/v1/reports
-Invoke-RestMethod http://127.0.0.1:8765/api/v1/reports/ZPBVDXhxLKFYv2jC/fights/6/summary
-Invoke-RestMethod http://127.0.0.1:8765/api/v1/reports/ZPBVDXhxLKFYv2jC/fights/6/deaths
+$headers = @{ 'X-Carter-Guild-ID' = '123456789012345678' }
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/reports
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/fights
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/reports/ZPBVDXhxLKFYv2jC/fights/6/summary
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/reports/ZPBVDXhxLKFYv2jC/fights/6/deaths
 ```
 
-Responses include schema version and stable report/fight/player/death IDs.
+Responses include schema version and stable report/fight/player/death IDs. The guild-scoped
+`/fights` collection uses absolute encounter timestamps and is sorted newest first across reports.
 Errors have a stable `{ "error": { "code": ..., "message": ... } }` shape.
 Times are relative to pull and expressed in seconds. Rankings default to 10 and
 cap at 50. Death context defaults to 10 seconds and caps at 30. Replays default
@@ -161,16 +190,25 @@ The server can import and prepare a report without blocking an HTTP request:
 - `GET /api/v1/imports/{job_id}`
 
 The POST returns `202 Accepted` with a bounded background job. Poll its GET route
-until `status` is `succeeded`, `partial`, or `failed`. Progress, per-fight results,
+until `status` is `succeeded`, `partial`, `failed`, or `rate_limited`. Progress, per-fight results,
 and stable error codes are returned, but credentials, raw events, report URLs, and
 filesystem paths are not. Imports are serialized because cache pruning and fight
 analysis share the managed storage directory. At most four jobs may be queued or
 running and the newest fifty job records are retained in memory.
 
-Only the backend process supplies `WARCRAFT_LOGS_CLIENT_ID` and
-`WARCRAFT_LOGS_CLIENT_SECRET`; clients cannot submit credentials or a destination
-path. Job state is process-local and is not restored after a server restart, while
+Only the backend process reads the root `.env` credential entries; API clients
+cannot submit credentials or a destination path. Standard process variables
+`WARCRAFT_LOGS_CLIENT_ID` and `WARCRAFT_LOGS_CLIENT_SECRET` can override the
+file. Job state is process-local and is not restored after a server restart, while
 completed report caches and fight analyses remain on disk.
+
+The optional boolean `refresh` request field defaults to `false`. With the default,
+an existing valid cache is analyzed locally without loading credentials or contacting
+Warcraft Logs. Use `refresh: true` only for a growing live report. Event downloads are
+atomically checkpointed at a bounded interval and whenever a request fails in a private
+`*.download.json` sidecar, avoiding a full growing-cache rewrite after every page. A 429
+stops the job as `rate_limited`; the next import resumes from the saved fight/page cursor.
+Other interrupted downloads retain the same checkpoint and also resume when retried.
 
 ### Live local log API
 
@@ -178,13 +216,15 @@ The same server can follow the locally written WoW combat log. The path is an
 owner-controlled startup option and cannot be supplied through an HTTP request:
 
 ```powershell
-python analysis_api.py --live-log "D:\World of Warcraft\_retail_\Logs\WoWCombatLog.txt"
+python analysis_api.py --live-log "D:\World of Warcraft\_retail_\Logs\WoWCombatLog.txt" `
+  --live-guild-id 123456789012345678
 ```
 
 To load a custom placeholder schedule, add:
 
 ```powershell
 python analysis_api.py --live-log "D:\World of Warcraft\_retail_\Logs\WoWCombatLog.txt" `
+  --live-guild-id 123456789012345678 `
   --mechanic-scripts mechanic_scripts.example.json
 ```
 
@@ -205,16 +245,44 @@ atomically under the managed `live-analysis` directory. Requests never parse
 the growing source file and responses expose only its filename, never its full
 path or raw lines.
 
-On first live-service startup, the follower generates a cryptographically random
-access token at `STORAGE/live-analysis/.live-access-token`. It reuses that token
-across restarts, restricts it to owner-only permissions, and refuses to overwrite
-an existing invalid value. `/api/v1/live/status` exposes only
-`access_token_ready` and `access_token_fingerprint`; the raw token is never
-logged or returned. This is groundwork for later authentication—the current API
-does not enforce the token yet.
+Use the desktop launcher's **Generate / verify live token** action for the
+intended Discord guild before starting a remote sender. The cryptographically
+random value is stored at
+`STORAGE/guilds/GUILD_ID/live-analysis/.live-access-token`, reused across
+restarts, restricted to owner-only permissions, and never logged or returned.
+`/api/v1/live/status` exposes only `access_token_ready` and a fingerprint.
+Remote ingestion requires the raw token, guild ID, stream ID, and byte offset on
+every request. A failed authentication attempt does not provision a new guild
+directory.
+
+The game-machine client is `live_log_pipeline.py`. It has no third-party Python
+dependencies and accepts either an HTTPS origin or `/api/v1` base URL. Keep its
+token and cursor outside the checkout. It resumes acknowledged bytes, assigns a
+new logical stream after file replacement or truncation, retries unavailable
+servers, and refuses redirects. The backend restores an in-progress remote pull
+from its durable spool after a restart.
+
+```powershell
+py -3 live_log_pipeline.py `
+  --log "D:\World of Warcraft\_retail_\Logs\WoWCombatLog.txt" `
+  --url "https://carter.example" `
+  --guild-id "123456789012345678" `
+  --token-file "$env:LOCALAPPDATA\Carter\live-token.txt" `
+  --state "$env:LOCALAPPDATA\Carter\live-log-state.json"
+```
+
+Omit `--from-start` for normal use so a newly selected existing log starts at
+its current end. WoW must be actively writing combat-log lines for uploads to
+appear.
+
+Keep the API listener on loopback. Reach it through an SSH local forward or a
+protected reverse proxy that exposes only `POST /api/v1/live/ingest`; the other
+analysis routes are not independently internet-authenticated. Do not publish
+port 8765 directly.
 
 Live endpoints are:
 
+- `POST /api/v1/live/ingest` (remote sender; live token required)
 - `GET /api/v1/live/status`
 - `GET /api/v1/live/timer-module`
 - `POST /api/v1/live/timer-module/arm`
@@ -246,9 +314,9 @@ Live endpoints are:
 For example:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8765/api/v1/live/status
-Invoke-RestMethod http://127.0.0.1:8765/api/v1/live/summary
-Invoke-RestMethod "http://127.0.0.1:8765/api/v1/live/updates?since=120&limit=100"
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/live/status
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/live/summary
+Invoke-RestMethod -Headers $headers "http://127.0.0.1:8765/api/v1/live/updates?since=120&limit=100"
 ```
 
 Clients poll `updates` with the last received cursor and use the other endpoints
@@ -269,6 +337,7 @@ Reviewed timer exports can be loaded when the live API starts:
 ```powershell
 python analysis_api.py `
   --live-log "D:\World of Warcraft\_retail_\Logs\WoWCombatLog.txt" `
+  --live-guild-id 123456789012345678 `
   --timer-modules timer-exports
 ```
 
@@ -288,6 +357,7 @@ being responsible for the authoritative start time:
 
 ```powershell
 Invoke-RestMethod -Method Post `
+  -Headers $headers `
   -ContentType application/json `
   -Body '{"encounter_id":3429,"difficulty":4}' `
   http://127.0.0.1:8765/api/v1/live/timer-module/arm
@@ -313,14 +383,15 @@ API on an empty test file in the first:
 
 ```powershell
 New-Item -ItemType File -Force simulated-WoWCombatLog.txt
-python analysis_api.py --live-log simulated-WoWCombatLog.txt
+python analysis_api.py --live-log simulated-WoWCombatLog.txt `
+  --live-guild-id 123456789012345678
 ```
 
 Append a fast simulated pull in the second:
 
 ```powershell
 python simulate_live_encounter.py simulated-WoWCombatLog.txt --duration 25 --delay 0.25
-Invoke-RestMethod http://127.0.0.1:8765/api/v1/live/timeline
+Invoke-RestMethod -Headers $headers http://127.0.0.1:8765/api/v1/live/timeline
 ```
 
 Use `--kill` to produce a successful result. Without it, the simulator produces

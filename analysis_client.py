@@ -19,6 +19,7 @@ import aiohttp
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_SVG_BYTES = 2 * 1024 * 1024
 MAX_PNG_BYTES = 8 * 1024 * 1024
+MAX_GIF_BYTES = 8 * 1024 * 1024
 REPORT_ID = re.compile(r"^[A-Za-z0-9]{8,32}$")
 DEATH_ID = re.compile(r"^[A-Za-z0-9:._-]{1,240}$")
 
@@ -85,14 +86,20 @@ class AnalysisClient:
         if self._session is not None and self._owns_session and not self._session.closed:
             await self._session.close()
 
-    async def _request(self, method: str, path: str, *, params=None, payload=None):
+    def for_guild(self, guild_id: int) -> "GuildAnalysisClient":
+        return GuildAnalysisClient(self, _guild_id(guild_id))
+
+    async def _request(self, method: str, path: str, *, params=None, payload=None,
+                       guild_id: str | None = None):
         if not self.settings.enabled:
             raise AnalysisClientError("analysis_disabled")
         session = await self._http()
         url = self.settings.base_url.rstrip("/") + "/" + path.lstrip("/")
         try:
             async with session.request(
-                method, url, params=params, json=payload, allow_redirects=False,
+                method, url, params=params, json=payload,
+                headers={"X-Carter-Guild-ID": guild_id} if guild_id else None,
+                allow_redirects=False,
             ) as response:
                 length = response.content_length
                 if length is not None and length > MAX_RESPONSE_BYTES:
@@ -131,6 +138,9 @@ class AnalysisClient:
 
     async def reports(self):
         return await self._request("GET", "reports")
+
+    async def all_fights(self):
+        return await self._request("GET", "fights")
 
     async def fights(self, report_id: str):
         return await self._request("GET", f"reports/{_report(report_id)}/fights")
@@ -232,18 +242,60 @@ class AnalysisClient:
             params={"seconds_before": _seconds(seconds_before)},
         )
 
-    async def import_report(self, report_url: str):
+    async def import_report(self, report_url: str, *, refresh: bool = False):
         value = str(report_url).strip()
         if not 1 <= len(value) <= 500:
             raise AnalysisClientError("invalid_report_url")
-        return await self._request("POST", "imports", payload={"report_url": value})
+        return await self._request(
+            "POST", "imports", payload={"report_url": value, "refresh": bool(refresh)},
+        )
 
     async def import_job(self, job_id: str):
         return await self._request("GET", f"imports/{quote(_identifier(job_id), safe='')}")
 
+    async def reset_import_data(self):
+        return await self._request("POST", "imports/reset", payload={})
+
+
+class GuildAnalysisClient(AnalysisClient):
+    """A non-owning client view that scopes every backend request to one guild."""
+
+    def __init__(self, base: AnalysisClient, guild_id: str):
+        self._base = base
+        self.guild_id = guild_id
+        self.settings = base.settings
+
+    async def _request(self, method: str, path: str, *, params=None, payload=None,
+                       guild_id: str | None = None):
+        return await self._base._request(
+            method, path, params=params, payload=payload, guild_id=self.guild_id,
+        )
+
+    async def close(self):
+        return None
+
 
 def render_answer_image(payload: dict[str, Any]) -> AnalysisImage | None:
-    """Convert one trusted backend SVG payload into a bounded Discord PNG."""
+    """Return a validated GIF when available, otherwise render the SVG as PNG."""
+    animation = payload.get("animation")
+    if isinstance(animation, dict) and animation.get("status") == "available":
+        if animation.get("mime_type") != "image/gif" or animation.get("encoding") != "base64":
+            raise AnalysisClientError("unsupported_image")
+        encoded = animation.get("data")
+        if not isinstance(encoded, str) or len(encoded) > (MAX_GIF_BYTES * 4 // 3 + 16):
+            raise AnalysisClientError("invalid_image")
+        try:
+            gif = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise AnalysisClientError("invalid_image") from None
+        if (len(gif) > MAX_GIF_BYTES
+                or not gif.startswith((b"GIF87a", b"GIF89a"))):
+            raise AnalysisClientError("invalid_image")
+        report = str(payload.get("report_id") or payload.get("session_id") or "raid")
+        fight = str(payload.get("fight_id") or payload.get("attempt") or "fight")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "-", f"{report}-{fight}")[:100]
+        alt = str(animation.get("alt_text") or "Focused positions before death")[:300]
+        return AnalysisImage(gif, f"carter-death-{safe}.gif", alt)
     image = payload.get("image")
     if not isinstance(image, dict) or image.get("status") != "available":
         return None
@@ -289,6 +341,8 @@ def answer_without_image_bytes(payload: dict[str, Any]) -> dict[str, Any]:
     answer = payload.get("answer") if isinstance(payload.get("answer"), dict) else {}
     analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
     image = payload.get("image") if isinstance(payload.get("image"), dict) else {}
+    animation = (payload.get("animation")
+                 if isinstance(payload.get("animation"), dict) else {})
     primary = _compact_evidence(analysis.get("primary_cause"), include_contributors=True)
     killing = _compact_evidence(analysis.get("killing_blow"))
     player = analysis.get("player") if isinstance(analysis.get("player"), dict) else {}
@@ -308,6 +362,12 @@ def answer_without_image_bytes(payload: dict[str, Any]) -> dict[str, Any]:
                 "status", "reason", "kind", "map_id", "time_seconds", "position_confidence",
                 "sample_age_seconds", "alt_text", "width", "height",
             ) if key in image
+        },
+        "animation": {
+            key: _bounded_scalar(animation.get(key)) for key in (
+                "status", "reason", "kind", "map_id", "time_seconds", "alt_text",
+                "width", "height", "frames", "fps", "duration_seconds",
+            ) if key in animation
         },
     }
 
@@ -384,6 +444,13 @@ def _identifier(value: str) -> str:
     value = str(value).strip()
     if not 1 <= len(value) <= 240 or "/" in value or any(ord(char) < 32 for char in value):
         raise AnalysisClientError("invalid_identifier")
+    return value
+
+
+def _guild_id(value: int) -> str:
+    value = str(value).strip()
+    if not value.isdecimal() or not 1 <= len(value) <= 20 or int(value) <= 0:
+        raise AnalysisClientError("invalid_guild_id")
     return value
 
 

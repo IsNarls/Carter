@@ -1,4 +1,4 @@
-"""One speaker, one bounded conversation, with quota-only opt-in fallback."""
+"""One speaker, one request/response exchange, with quota-only opt-in fallback."""
 import asyncio
 import audioop
 import logging
@@ -12,6 +12,8 @@ from discord_receive import PCMReceiveSink
 from providers import ProviderError, create_provider
 
 log = logging.getLogger("carter.session")
+REPLAY_TTL_SECONDS = 600
+MAX_REPLAY_BYTES = PCMPlayback.FRAME * 1000
 
 
 @dataclass(frozen=True)
@@ -24,9 +26,10 @@ class SessionLimits:
 
 class VoiceSession:
     def __init__(self, settings, limits=SessionLimits(), factory=create_provider,
-                 tool_handler=None):
+                 tool_handler=None, completion_handler=None):
         self.settings, self.limits, self.factory = settings, limits, factory
         self.tool_handler = tool_handler
+        self.completion_handler = completion_handler
         self.task = None
         self.provider = None
         self.voice = None
@@ -45,6 +48,9 @@ class VoiceSession:
         self.receive_fault = None
         self.owns_receiver = True
         self.initial_audio = deque(maxlen=250)
+        self.input_complete = False
+        self.response_complete = None
+        self.response_completed_at = None
         self.input_frames = 0
         self.speech_turns = 0
         self.provider_events = 0
@@ -52,6 +58,9 @@ class VoiceSession:
         self.tool_calls = 0
         self._logged_first_input = False
         self._logged_first_output = False
+        self._response_pcm = bytearray()
+        self.last_response_pcm = b""
+        self.last_response_at = None
 
     @property
     def active(self):
@@ -80,13 +89,16 @@ class VoiceSession:
         except queue.Full:
             self.receive_fault = "input_overflow"
 
-    def _drain(self):
+    def _drain_input(self):
         self.initial_audio.clear()
         while True:
             try:
                 self.input.get_nowait()
             except queue.Empty:
                 break
+
+    def _drain(self):
+        self._drain_input()
         if self.playback:
             self.playback.clear()
 
@@ -114,9 +126,14 @@ class VoiceSession:
             self.input_frames, self.speech_turns, self.provider_events, self.input.qsize(),
             self.receive_fault or "none",
         )
+        had_output = self._logged_first_output
         self.accept_audio = False
         self._drain()
         await self._close_provider()
+        # Once Carter has emitted any answer audio, reconnecting could create a
+        # second answer without another wake phrase. End this exchange instead.
+        if had_output:
+            raise error
         if error.quota and self.provider_name == "gemini" and self.limits.allow_fallback:
             self.state = "fallback"
             log.warning("Gemini quota reached; opt-in paid OpenAI fallback selected; context resets")
@@ -131,6 +148,10 @@ class VoiceSession:
         else:
             raise error
         self._drain()
+        self.input_complete = False
+        self.response_completed_at = None
+        if self.response_complete:
+            self.response_complete.clear()
         self.accept_audio = True
         self.state = "listening"
 
@@ -146,6 +167,10 @@ class VoiceSession:
         self.input_frames = self.speech_turns = self.provider_events = self.tool_calls = 0
         self.rejected_speaker_frames = 0
         self._logged_first_input = self._logged_first_output = False
+        self._response_pcm.clear()
+        self.input_complete = False
+        self.response_complete = asyncio.Event()
+        self.response_completed_at = None
         self.started = self.last_activity = time.monotonic()
         self.playback = PCMPlayback()
         try:
@@ -179,19 +204,32 @@ class VoiceSession:
             self.initial_audio.extend((captured, pcm) for captured, pcm in frames
                                       if len(pcm) == 3840)
 
+    async def _finish_input_turn(self):
+        if self.input_complete:
+            return
+        # Close capture before ending the provider turn. This makes the exchange
+        # immutable: speech after the first request cannot become a follow-up.
+        self.accept_audio = False
+        self._drain_input()
+        await self.provider.end_audio()
+        self.input_complete = True
+        log.info("AI input turn ended: input=%.2fs; awaiting one response", self.input_seconds)
+
     async def _send(self):
         converter = PCMConverter(48000, self.provider.input_rate, source_channels=2)
         last_voice = time.monotonic()
         streaming = False
         while True:
+            if self.input_complete:
+                await asyncio.sleep(0.05)
+                continue
             try:
                 seeded = bool(self.initial_audio)
                 captured, pcm = self.initial_audio.popleft() if seeded else self.input.get_nowait()
             except queue.Empty:
                 if streaming and time.monotonic() - last_voice > 0.7:
-                    await self.provider.end_audio()
+                    await self._finish_input_turn()
                     streaming = False
-                    log.info("AI input turn ended: input=%.2fs", self.input_seconds)
                 await asyncio.sleep(0.01)
                 continue
             if time.monotonic() - captured > (6 if seeded else 1):
@@ -201,9 +239,8 @@ class VoiceSession:
             if voiced:
                 self.last_activity = last_voice = now
             elif streaming and now - last_voice > 0.7:
-                await self.provider.end_audio()
+                await self._finish_input_turn()
                 streaming = False
-                log.info("AI input turn ended: input=%.2fs", self.input_seconds)
                 continue
             if not streaming:
                 if not voiced:
@@ -218,16 +255,34 @@ class VoiceSession:
 
     async def _receive(self):
         converter = PCMConverter(24000, 48000, target_channels=2)
+        completed = False
+        awaiting_tool_followup = False
         async for event in self.provider.receive_audio():
             self.provider_events += 1
             if self.provider_events == 1:
                 log.info("First AI provider event received: kind=%s", event.kind)
+            if event.kind == "usage":
+                self.usage = event.usage or {}
+                continue
+            # Some providers send usage immediately after completion. Keep
+            # consuming metadata briefly, but never queue a second response.
+            if completed:
+                continue
             if event.kind == "audio":
+                # Audio after a function response is the actual user-facing
+                # answer, not part of the tool-request turn.
+                awaiting_tool_followup = False
+                self.accept_audio = False
+                self._drain_input()
                 if event.sample_rate != converter.source_rate:
                     converter = PCMConverter(event.sample_rate, 48000, target_channels=2)
                 if len(event.data) > 1024 * 1024:
                     raise BufferError("Oversized provider audio")
-                self.playback.push(converter.convert(event.data))
+                converted = converter.convert(event.data)
+                if len(self._response_pcm) + len(converted) > MAX_REPLAY_BYTES:
+                    raise BufferError("Replay buffer full")
+                self._response_pcm.extend(converted)
+                self.playback.push(converted)
                 self.output_seconds += len(event.data) / (2 * event.sample_rate)
                 if not self._logged_first_output:
                     self._logged_first_output = True
@@ -235,10 +290,34 @@ class VoiceSession:
             elif event.kind in {"interrupted", "speech_started"}:
                 self.playback.clear()
                 converter.state = None
+                if self._logged_first_output:
+                    self.accept_audio = False
+                    self._drain_input()
+                    completed = True
+                    self.response_completed_at = time.monotonic()
+                    self.response_complete.set()
+                    log.info("AI response interrupted after output; exchange will close")
             elif event.kind == "turn_complete":
+                if awaiting_tool_followup:
+                    # Gemini closes the model turn that requested a function
+                    # after Carter returns the tool result. A second model turn
+                    # contains the spoken answer. Closing the exchange here
+                    # produces a silent output=0.00s response.
+                    awaiting_tool_followup = False
+                    log.info(
+                        "AI tool-request turn completed; awaiting spoken follow-up",
+                    )
+                    continue
                 self.playback.finish_turn()
-            elif event.kind == "usage":
-                self.usage = event.usage or {}
+                self.accept_audio = False
+                self._drain_input()
+                completed = True
+                self.response_completed_at = time.monotonic()
+                self.response_complete.set()
+                if self._response_pcm:
+                    self.last_response_pcm = bytes(self._response_pcm)
+                    self.last_response_at = self.response_completed_at
+                log.info("One AI response completed; waiting for Discord playback to drain")
             elif event.kind == "tool_call":
                 if not self.tool_handler:
                     raise ProviderError("tool_handler_unavailable")
@@ -264,11 +343,18 @@ class VoiceSession:
                         "id": call.get("id"), "name": call.get("name"), "response": response,
                     })
                 await self.provider.send_tool_results(results)
+                awaiting_tool_followup = True
         raise ProviderError("connection_closed", transient=True)
 
     async def _watch(self):
         while True:
             now = time.monotonic()
+            if (self.response_complete and self.response_complete.is_set()
+                    and self.playback.is_idle()
+                    and now - self.response_completed_at >= 0.1):
+                self.reason = "response_complete"
+                log.info("One-to-one AI exchange completed; wake listening will rearm")
+                return
             if now - self.started >= self.limits.max_seconds:
                 self.reason = "session_limit"
                 log.info("AI session watcher reached absolute limit")
@@ -327,7 +413,14 @@ class VoiceSession:
                 self.last_error or "none",
             )
             await self._release()
-            if self.reason != "stopped":
+            if self.reason != "stopped" and self.completion_handler:
+                try:
+                    await self.completion_handler()
+                except Exception as error:
+                    log.warning(
+                        "Automatic wake rearm failed: %s", type(error).__name__,
+                    )
+            if self.reason not in {"stopped", "response_complete"}:
                 await self._notice(f"Carter AI stopped ({self.reason}).")
 
     async def _release(self):
@@ -358,3 +451,16 @@ class VoiceSession:
         if self.active:
             await self._release()
         self.task = None
+
+    def replay_audio(self):
+        """Return the recent generated response without retaining microphone audio."""
+        if (not self.last_response_pcm or self.last_response_at is None
+                or time.monotonic() - self.last_response_at > REPLAY_TTL_SECONDS):
+            self.clear_replay()
+            return b""
+        return self.last_response_pcm
+
+    def clear_replay(self):
+        self._response_pcm.clear()
+        self.last_response_pcm = b""
+        self.last_response_at = None

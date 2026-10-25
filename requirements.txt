@@ -7,5 +7,6 @@ google-genai==2.31.0
 aiohttp>=3.12,<4
 # Convert the backend's bounded SVG death/replay payload into a Discord-safe PNG.
 CairoSVG>=2.7,<3
+Pillow>=10,<13
 # Offline wake-word recognition; model installed once by setup_wakeword.py.
 vosk==0.3.45

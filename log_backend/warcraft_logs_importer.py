@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import os
 import re
 import shutil
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,10 +22,34 @@ GRAPHQL_URL = 'https://www.warcraftlogs.com/api/v2/client'
 REPORT_RE = re.compile(r'(?:warcraftlogs\.com/(?:reports|reports/compare)/|^)([A-Za-z0-9]{8,32})')
 MAX_STORED_REPORTS = 5
 MAX_BATCH_REPORTS = 5
+DOWNLOAD_CHECKPOINT_FORMAT = 'wow-log-tools-download-checkpoint-v1'
+# Checkpoints contain all events downloaded so far. Rewriting that growing JSON
+# document after every API page makes large reports progressively slower. Keep
+# periodic crash recovery while always forcing a checkpoint before propagating a
+# download error (including a rate limit).
+DOWNLOAD_CHECKPOINT_INTERVAL_SECONDS = 300.0
+
+
+def _download_debug(message: str, progress: Callable[[str], None] | None = None) -> None:
+    if os.environ.get('WARCRAFT_LOGS_DOWNLOAD_DEBUG') == '1':
+        print(f'Warcraft Logs download: {message}', file=sys.stderr, flush=True)
+        if progress is not None:
+            progress(f'[debug] {message}')
 
 
 class WarcraftLogsError(RuntimeError):
     pass
+
+
+class WarcraftLogsRateLimitError(WarcraftLogsError):
+    """Stable rate-limit signal that never includes response bodies or credentials."""
+
+    def __init__(self, retry_after_seconds: int | None = None):
+        self.retry_after_seconds = retry_after_seconds
+        message = 'Warcraft Logs API rate limit reached; the download checkpoint was preserved.'
+        if retry_after_seconds is not None:
+            message += f' Retry after approximately {retry_after_seconds} seconds.'
+        super().__init__(message)
 
 
 def analysis_directory(cache_path: Path) -> Path:
@@ -40,12 +67,67 @@ def metadata_path(cache_path: Path) -> Path:
     return cache_path.with_name(f'{stem}.meta.json')
 
 
+def download_checkpoint_path(cache_path: Path) -> Path:
+    """Return the private resumable-download sidecar for one report cache."""
+    cache_path = Path(cache_path)
+    return cache_path.with_name(cache_path.name + '.download.json')
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+        json.dump(payload, output, ensure_ascii=False, separators=(',', ':'))
+    os.replace(temporary, path)
+
+
+def _load_download_checkpoint(path: Path, code: str) -> dict | None:
+    try:
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if (not isinstance(payload, dict)
+            or payload.get('format') != DOWNLOAD_CHECKPOINT_FORMAT
+            or str(payload.get('report_code') or '').casefold() != code.casefold()
+            or not isinstance(payload.get('report'), dict)
+            or not isinstance(payload.get('fights'), list)
+            or not isinstance(payload.get('eventsByFight'), dict)):
+        return None
+    try:
+        next_index = int(payload.get('next_fight_index') or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= next_index <= len(payload['fights']):
+        return None
+    current = payload.get('current')
+    if current is not None and (not isinstance(current, dict)
+            or not isinstance(current.get('events'), list)):
+        return None
+    payload['next_fight_index'] = next_index
+    return payload
+
+
 def prune_report_caches(directory: Path, maximum: int = MAX_STORED_REPORTS) -> list[Path]:
-    """Keep only the newest Warcraft Logs report caches and their analyses."""
+    """Keep reports with the newest raid timestamps, independent of download order."""
     directory = Path(directory).resolve()
+
+    def chronology(path):
+        try:
+            payload = json.loads(metadata_path(path).read_text(encoding='utf-8'))
+            report = payload.get('report') if isinstance(payload, dict) else None
+            if isinstance(report, dict):
+                timestamp = int(report.get('endTime') or report.get('startTime') or 0)
+                if timestamp > 0:
+                    return timestamp, path.stat().st_mtime_ns, path.name.lower()
+        except (OSError, TypeError, ValueError):
+            pass
+        return 0, path.stat().st_mtime_ns, path.name.lower()
+
     caches = sorted(
         (path for path in directory.glob('warcraft-logs-*.wcl.json') if path.is_file()),
-        key=lambda path: (path.stat().st_mtime_ns, path.name.lower()), reverse=True,
+        key=chronology, reverse=True,
     )
     removed = []
     for cache_path in caches[max(0, maximum):]:
@@ -63,13 +145,16 @@ def prune_report_caches(directory: Path, maximum: int = MAX_STORED_REPORTS) -> l
     return removed
 
 
+PROJECT_ENV_FILE = Path(__file__).resolve().parent.parent / '.env'
+
+
 def load_credentials(env_path: Path | None = None) -> tuple[str, str]:
-    """Read Warcraft Logs credentials from process variables or a local .env file.
+    """Read Warcraft Logs credentials from process variables or Carter's root .env.
 
     Process environment variables take precedence. This intentionally implements
     only the small KEY=VALUE subset needed here, keeping the project dependency-free.
     """
-    env_path = Path(env_path) if env_path is not None else Path(__file__).with_name('.env')
+    env_path = Path(env_path) if env_path is not None else PROJECT_ENV_FILE
     values: dict[str, str] = {}
     if env_path.is_file():
         for raw_line in env_path.read_text(encoding='utf-8-sig').splitlines():
@@ -86,13 +171,28 @@ def load_credentials(env_path: Path | None = None) -> tuple[str, str]:
                 value = value[1:-1]
             values[key] = value
     client_id = os.environ.get(
-        'WARCRAFT_LOGS_CLIENT_ID', os.environ.get('WCL_CLIENT_ID',
-                                                  values.get('WARCRAFT_LOGS_CLIENT_ID',
-                                                             values.get('WCL_CLIENT_ID', ''))))
+        'WARCRAFT_LOGS_CLIENT_ID', os.environ.get(
+            'CARTER_WARCRAFT_LOGS_CLIENT_ID', os.environ.get(
+                'WCL_CLIENT_ID', values.get(
+                    'WARCRAFT_LOGS_CLIENT_ID', values.get(
+                        'CARTER_WARCRAFT_LOGS_CLIENT_ID', values.get('WCL_CLIENT_ID', ''),
+                    ),
+                ),
+            ),
+        ),
+    )
     client_secret = os.environ.get(
-        'WARCRAFT_LOGS_CLIENT_SECRET', os.environ.get('WCL_CLIENT_SECRET',
-                                                      values.get('WARCRAFT_LOGS_CLIENT_SECRET',
-                                                                 values.get('WCL_CLIENT_SECRET', ''))))
+        'WARCRAFT_LOGS_CLIENT_SECRET', os.environ.get(
+            'CARTER_WARCRAFT_LOGS_CLIENT_SECRET', os.environ.get(
+                'WCL_CLIENT_SECRET', values.get(
+                    'WARCRAFT_LOGS_CLIENT_SECRET', values.get(
+                        'CARTER_WARCRAFT_LOGS_CLIENT_SECRET',
+                        values.get('WCL_CLIENT_SECRET', ''),
+                    ),
+                ),
+            ),
+        ),
+    )
     return client_id.strip(), client_secret.strip()
 
 
@@ -145,6 +245,7 @@ class WarcraftLogsClient:
             headers={
                 'Authorization': f'Basic {credentials}',
                 'Content-Type': 'application/x-www-form-urlencoded',
+                'Accept-Encoding': 'gzip',
                 'User-Agent': 'WoW-Combat-Log-Tools/1.0',
             },
             method='POST',
@@ -163,21 +264,42 @@ class WarcraftLogsClient:
             headers={
                 'Authorization': f'Bearer {self.access_token}',
                 'Content-Type': 'application/json',
+                'Accept-Encoding': 'gzip',
                 'User-Agent': 'WoW-Combat-Log-Tools/1.0',
             },
             method='POST',
         )
         payload = self._open_json(request)
         if payload.get('errors'):
-            details = '; '.join(item.get('message', str(item)) for item in payload['errors'])
+            for item in payload['errors']:
+                extensions = item.get('extensions') if isinstance(item, dict) else {}
+                code = str((extensions or {}).get('code') or '').upper()
+                message = str(item.get('message') or '') if isinstance(item, dict) else str(item)
+                if 'RATE_LIMIT' in code or 'RATE LIMIT' in message.upper():
+                    raise WarcraftLogsRateLimitError()
+            details = '; '.join(
+                str(item.get('message', item)) if isinstance(item, dict) else str(item)
+                for item in payload['errors']
+            )
             raise WarcraftLogsError(details)
         return payload.get('data', {})
 
     def _open_json(self, request: urllib.request.Request) -> dict:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode('utf-8'))
+                body = response.read()
+                if str(response.headers.get('Content-Encoding') or '').casefold() == 'gzip':
+                    body = gzip.decompress(body)
+                return json.loads(body.decode('utf-8'))
         except urllib.error.HTTPError as error:
+            if error.code == 429:
+                retry_after = None
+                try:
+                    value = error.headers.get('Retry-After')
+                    retry_after = max(0, int(value)) if value is not None else None
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                raise WarcraftLogsRateLimitError(retry_after) from error
             body = error.read().decode('utf-8', errors='replace')
             try:
                 message = json.loads(body).get('error_description') or json.loads(body).get('error')
@@ -195,12 +317,14 @@ class WarcraftLogsClient:
 
     def download_report(self, report_url: str, destination: Path,
                         progress: Callable[[str], None] | None = None) -> Path:
-        """Download every event from every boss pull and atomically save a JSON cache."""
+        """Download a report with an atomic page checkpoint that survives failures."""
         code = extract_report_code(report_url)
+        destination = Path(destination)
+        checkpoint_path = download_checkpoint_path(destination)
         progress = progress or (lambda _message: None)
         progress('Authenticating with Warcraft Logs...')
         self.authenticate()
-        progress(f'Reading report {code}...')
+        checkpoint = _load_download_checkpoint(checkpoint_path, code)
         metadata_query = """
         query Report($code: String!) {
           reportData { report(code: $code) {
@@ -218,13 +342,50 @@ class WarcraftLogsClient:
           } }
         }
         """
-        data = self.graphql(metadata_query, {'code': code})
-        report = (data.get('reportData') or {}).get('report')
-        if not report:
-            raise WarcraftLogsError('The report was not found or is not accessible.')
-        fights = [fight for fight in report.get('fights', []) if fight.get('encounterID')]
-        if not fights:
-            raise WarcraftLogsError('This report contains no boss encounters.')
+        if checkpoint is not None:
+            report = checkpoint['report']
+            fights = checkpoint['fights']
+            events_by_fight = checkpoint['eventsByFight']
+            next_fight_index = max(0, int(checkpoint.get('next_fight_index') or 0))
+            current = checkpoint.get('current') if isinstance(checkpoint.get('current'), dict) else None
+            progress(f'Resuming report {code} from its saved download checkpoint...')
+        else:
+            progress(f'Reading report {code}...')
+            data = self.graphql(metadata_query, {'code': code})
+            report = (data.get('reportData') or {}).get('report')
+            if not report:
+                raise WarcraftLogsError('The report was not found or is not accessible.')
+            fights = [fight for fight in report.get('fights', []) if fight.get('encounterID')]
+            if not fights:
+                raise WarcraftLogsError('This report contains no boss encounters.')
+            events_by_fight = {}
+            next_fight_index = 0
+            current = None
+
+        last_checkpoint = time.monotonic()
+
+        def save_checkpoint():
+            nonlocal last_checkpoint
+            _atomic_json(checkpoint_path, {
+                'format': DOWNLOAD_CHECKPOINT_FORMAT,
+                'report_code': code,
+                'report': report,
+                'fights': fights,
+                'eventsByFight': events_by_fight,
+                'next_fight_index': next_fight_index,
+                'current': current,
+            })
+            last_checkpoint = time.monotonic()
+
+        def save_periodic_checkpoint():
+            if time.monotonic() - last_checkpoint >= DOWNLOAD_CHECKPOINT_INTERVAL_SECONDS:
+                save_checkpoint()
+
+        # A resumed checkpoint may already be very large. Do not rewrite it just
+        # to begin the request; the next periodic checkpoint or any failure will
+        # persist new progress.
+        if checkpoint is None:
+            save_checkpoint()
 
         event_query = """
         query Events($code: String!, $start: Float!, $end: Float!) {
@@ -236,58 +397,88 @@ class WarcraftLogsClient:
           } }
         }
         """
-        events_by_fight: dict[str, list[dict]] = {}
         total = len(fights)
-        for index, fight in enumerate(fights, 1):
+        for offset in range(next_fight_index, total):
+            index = offset + 1
+            fight = fights[offset]
             fight_id = int(fight['id'])
             # Warcraft Logs currently returns empty continuation pages when
             # fightIDs and startTime are combined. A fight's report-relative
             # time range yields the same encounter events and paginates correctly.
-            start = float(fight.get('startTime') or 0)
-            end = float(fight.get('endTime') or start)
-            pages = 0
-            collected: list[dict] = []
+            initial_start = float(fight.get('startTime') or 0)
+            end = float(fight.get('endTime') or initial_start)
+            if current is not None and int(current.get('fight_id') or 0) == fight_id:
+                start = float(current.get('next_start') or initial_start)
+                pages = max(0, int(current.get('pages') or 0))
+                collected = [item for item in current.get('events', [])
+                             if isinstance(item, dict)]
+            else:
+                start = initial_start
+                pages = 0
+                collected = []
+                current = {'fight_id': fight_id, 'next_start': start,
+                           'pages': pages, 'events': collected}
             while True:
                 pages += 1
                 progress(f'Downloading pull {index}/{total}: {fight.get("name", "Encounter")} '
                          f'({len(collected):,} events)...')
-                page_data = self.graphql(event_query, {
-                    'code': code, 'start': start, 'end': end,
-                })
+                request_started = time.perf_counter()
+                _download_debug(
+                    f'report={code} fight={fight_id} pull={index}/{total} page={pages} '
+                    f'start={start:g} end={end:g} events_before={len(collected)} request_started',
+                    progress,
+                )
+                try:
+                    page_data = self.graphql(event_query, {
+                        'code': code, 'start': start, 'end': end,
+                    })
+                except Exception:
+                    # Persist every successfully received page before returning a
+                    # retryable failure to the import manager.
+                    save_checkpoint()
+                    raise
                 paginator = (((page_data.get('reportData') or {}).get('report') or {})
                              .get('events') or {})
                 batch = paginator.get('data') or []
                 collected.extend(item for item in batch if isinstance(item, dict))
                 next_timestamp = paginator.get('nextPageTimestamp')
+                _download_debug(
+                    f'report={code} fight={fight_id} pull={index}/{total} page={pages} '
+                    f'request_seconds={time.perf_counter() - request_started:.2f} '
+                    f'returned_events={len(batch)} collected_events={len(collected)} '
+                    f'next_start={next_timestamp}',
+                    progress,
+                )
                 if next_timestamp is None:
+                    events_by_fight[str(fight_id)] = collected
+                    next_fight_index = index
+                    current = None
+                    save_periodic_checkpoint()
                     break
                 next_start = float(next_timestamp)
                 if next_start <= start or pages > 10000:
                     raise WarcraftLogsError('Event pagination stopped making progress.')
                 start = next_start
-            events_by_fight[str(fight_id)] = collected
+                current = {'fight_id': fight_id, 'next_start': start,
+                           'pages': pages, 'events': collected}
+                save_periodic_checkpoint()
 
         cache = {
             'format': 'wow-log-tools-warcraft-logs-v1',
             'report': report,
             'eventsByFight': events_by_fight,
         }
-        destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_suffix(destination.suffix + '.part')
-        with temporary.open('w', encoding='utf-8') as output:
-            json.dump(cache, output, ensure_ascii=False, separators=(',', ':'))
-        temporary.replace(destination)
+        _atomic_json(destination, cache)
         metadata = {
             'format': 'wow-log-tools-metadata-v1',
             'report': {key: report.get(key) for key in ('code', 'title', 'startTime', 'endTime')},
             'fights': fights,
         }
-        meta_destination = metadata_path(destination)
-        meta_temporary = meta_destination.with_suffix(meta_destination.suffix + '.part')
-        with meta_temporary.open('w', encoding='utf-8') as output:
-            json.dump(metadata, output, ensure_ascii=False, separators=(',', ':'))
-        meta_temporary.replace(meta_destination)
+        _atomic_json(metadata_path(destination), metadata)
+        try:
+            checkpoint_path.unlink()
+        except FileNotFoundError:
+            pass
         removed = prune_report_caches(destination.parent)
         progress(f'Imported {sum(map(len, events_by_fight.values())):,} events.')
         if removed:
@@ -296,9 +487,9 @@ class WarcraftLogsClient:
 
 
 def download_report_batch(client: WarcraftLogsClient, report_values, directory: Path,
-                          progress: Callable[[str], None] | None = None
+                          progress: Callable[[str], None] | None = None, *, refresh: bool = False
                           ) -> tuple[list[Path], list[dict]]:
-    """Download up to five reports sequentially, continuing after per-report failures."""
+    """Reuse complete caches and stop a batch cleanly when the API is rate-limited."""
     prepared = prepare_report_batch(report_values)
     directory = Path(directory)
     progress = progress or (lambda _message: None)
@@ -308,11 +499,26 @@ def download_report_batch(client: WarcraftLogsClient, report_values, directory: 
     for index, (report_value, code) in enumerate(prepared, 1):
         destination = directory / f'warcraft-logs-{code}.wcl.json'
         prefix = f'Report {index}/{total} ({code})'
+        if (destination.is_file() and not refresh
+                and not download_checkpoint_path(destination).is_file()):
+            try:
+                load_cache(destination)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+            else:
+                completed.append(destination)
+                progress(f'{prefix}: reused existing local cache')
+                continue
         try:
             client.download_report(
                 report_value, destination,
                 lambda message, label=prefix: progress(f'{label}: {message}'))
             completed.append(destination)
+        except WarcraftLogsRateLimitError as error:
+            failures.append({'report_code': code, 'error': str(error), 'retryable': True,
+                             'checkpoint_saved': download_checkpoint_path(destination).is_file()})
+            progress(f'{prefix}: API limit reached; batch stopped safely')
+            break
         except Exception as error:
             failures.append({'report_code': code, 'error': str(error)})
             progress(f'{prefix}: failed: {error}')

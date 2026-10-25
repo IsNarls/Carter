@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from xml.etree import ElementTree
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 if __package__:
     from .analysis_api import create_server
@@ -23,6 +23,13 @@ else:
     from encounter_parser import Player, analyze_encounter, scan_encounters
     from warcraft_logs_importer import metadata_path
     from test_timer_export import sample_draft
+
+
+GUILD_ID = '123456789'
+
+
+def guild_request(url):
+    return Request(url, headers={'X-Carter-Guild-ID': GUILD_ID})
 
 
 def fixture_report():
@@ -69,8 +76,10 @@ class AnalysisApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir='.')
         self.root = Path(self.temp.name)
+        self.guild_root = self.root / 'guilds' / GUILD_ID
+        self.guild_root.mkdir(parents=True)
         report, events = fixture_report()
-        self.cache = self.root / 'warcraft-logs-ApiTest01.wcl.json'
+        self.cache = self.guild_root / 'warcraft-logs-ApiTest01.wcl.json'
         self.cache.write_text(json.dumps({'format': 'wow-log-tools-warcraft-logs-v1',
                                           'report': report, 'eventsByFight': {'11': events}}),
                               encoding='utf-8')
@@ -79,10 +88,39 @@ class AnalysisApiTests(unittest.TestCase):
                 key: report[key] for key in ('code', 'title', 'startTime', 'endTime')},
             'fights': report['fights']}), encoding='utf-8')
         analyze_encounter(self.cache, scan_encounters(self.cache)[0])
-        self.service = AnalysisService(self.root)
+        self.service = AnalysisService(self.guild_root)
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_reports_and_global_fights_use_encounter_timestamps_not_file_mtime(self):
+        newer_report = {
+            'code': 'NewerApi02', 'title': 'Chronologically newer',
+            'startTime': 100000, 'endTime': 110000,
+            'fights': [{'id': 2, 'encounterID': 100, 'name': 'New Boss',
+                        'startTime': 2000, 'endTime': 5000, 'kill': True,
+                        'difficulty': 16, 'size': 20}],
+        }
+        cache = self.guild_root / 'warcraft-logs-NewerApi02.wcl.json'
+        cache.write_text(json.dumps({
+            'format': 'wow-log-tools-warcraft-logs-v1',
+            'report': newer_report,
+            'eventsByFight': {'2': []},
+        }), encoding='utf-8')
+        metadata_path(cache).write_text(json.dumps({
+            'format': 'wow-log-tools-metadata-v1',
+            'report': {key: newer_report[key]
+                       for key in ('code', 'title', 'startTime', 'endTime')},
+            'fights': newer_report['fights'],
+        }), encoding='utf-8')
+
+        reports = self.service.list_reports()['reports']
+        fights = self.service.list_fights()['fights']
+
+        self.assertEqual(reports[0]['report_id'], 'NewerApi02')
+        self.assertEqual(fights[0]['report_id'], 'NewerApi02')
+        self.assertEqual(fights[0]['start_time_ms'], 102000)
+        self.assertEqual(fights[-1]['start_time_ms'], 1000)
 
     def test_queries_death_context_and_limits(self):
         self.assertEqual(self.service.get_encounter('ApiTest01', 11)['name'], 'Test Boss')
@@ -152,6 +190,11 @@ class AnalysisApiTests(unittest.TestCase):
         self.assertIn('Tiny Burn', payload['answer']['text'])
         self.assertEqual(payload['analysis']['position']['x'], 2)
         self.assertEqual(payload['image']['status'], 'available')
+        self.assertEqual(payload['animation']['status'], 'available')
+        self.assertEqual(payload['animation']['mime_type'], 'image/gif')
+        self.assertLessEqual(payload['animation']['fps'], 5)
+        self.assertLessEqual(payload['animation']['duration_seconds'], 5)
+        self.assertTrue(base64.b64decode(payload['animation']['data']).startswith(b'GIF'))
         svg = base64.b64decode(payload['image']['data']).decode()
         ElementTree.fromstring(svg)
         self.assertIn('Alex', svg)
@@ -165,10 +208,11 @@ class AnalysisApiTests(unittest.TestCase):
         try:
             url = (f'http://127.0.0.1:{server.server_port}/api/v1/reports/'
                    f'ApiTest01/fights/11/deaths/{death_id}/answer?seconds_before=100')
-            with urlopen(url) as response:
+            with urlopen(guild_request(url)) as response:
                 result = json.load(response)
             self.assertEqual(result['analysis']['seconds_before'], 30)
             self.assertEqual(result['image']['mime_type'], 'image/svg+xml')
+            self.assertEqual(result['animation']['mime_type'], 'image/gif')
         finally:
             server.shutdown()
             server.server_close()
@@ -192,6 +236,32 @@ class AnalysisApiTests(unittest.TestCase):
         result = build_death_answer(analysis, replay, {})
         self.assertEqual(result['image']['status'], 'unavailable')
         self.assertIn('Tiny Burn', result['answer']['text'])
+
+    def test_death_map_only_renders_selected_player_tanks_and_primary_boss(self):
+        death_id = self.service.list_deaths('ApiTest01', 11)['deaths'][0]['death_id']
+        payload = self.service.get_death_answer('ApiTest01', 11, death_id)
+        analysis, replay = payload['analysis'], payload['replay']
+        point = {'t': analysis['time_seconds'], 'x': 4, 'y': 2, 'map_id': 7,
+                 'sample_age_seconds': 0}
+        replay['actors'].update({
+            'tank-one': [point], 'tank-two': [{**point, 'x': 5}],
+            'boss': [{**point, 'x': 6}], 'unfocused-healer': [{**point, 'x': 7}],
+        })
+        names = {'tank-one': 'Tank One', 'tank-two': 'Tank Two',
+                 'boss': 'Test Boss', 'unfocused-healer': 'Busy Healer'}
+        roles = {analysis['player']['id']: 'player', 'tank-one': 'tank',
+                 'tank-two': 'tank', 'boss': 'boss'}
+
+        result = build_death_answer(analysis, replay, names, roles)
+        svg = base64.b64decode(result['image']['data']).decode()
+
+        self.assertIn('Tank One · tank', svg)
+        self.assertIn('Tank Two · tank', svg)
+        self.assertIn('Test Boss · boss', svg)
+        self.assertIn('selected player', svg)
+        self.assertNotIn('Busy Healer', svg)
+        self.assertEqual(svg.count('<circle'), 3)
+        self.assertEqual(svg.count('stroke-width="3"'), 1)
 
     def test_live_answer_uses_one_snapshot(self):
         timeline = self.service._timeline('ApiTest01', 11)
@@ -217,15 +287,22 @@ class AnalysisApiTests(unittest.TestCase):
         thread.start()
         base = f'http://127.0.0.1:{server.server_port}/api/v1'
         try:
-            with urlopen(base + '/reports/ApiTest01/fights/11/summary') as response:
+            with urlopen(guild_request(
+                    base + '/reports/ApiTest01/fights/11/summary')) as response:
                 payload = json.load(response)
             self.assertEqual(payload['fight_id'], 11)
-            with urlopen(base + '/reports/ApiTest01/fights/11/rankings/dps') as response:
+            with urlopen(guild_request(
+                    base + '/reports/ApiTest01/fights/11/rankings/dps')) as response:
                 self.assertEqual(json.load(response)['metric'], 'dps')
-            with urlopen(base + '/reports/ApiTest01/fights/11/rankings/hps') as response:
+            with urlopen(guild_request(
+                    base + '/reports/ApiTest01/fights/11/rankings/hps')) as response:
                 self.assertEqual(json.load(response)['metric'], 'hps')
+            with urlopen(guild_request(base + '/fights')) as response:
+                fights = json.load(response)['fights']
+            self.assertEqual(fights[0]['report_id'], 'ApiTest01')
+            self.assertEqual(fights[0]['start_time_ms'], 1000)
             with self.assertRaises(HTTPError) as raised:
-                urlopen(base + '/missing')
+                urlopen(guild_request(base + '/missing'))
             self.assertEqual(raised.exception.code, 404)
             self.assertEqual(json.load(raised.exception)['error']['code'], 'ENDPOINT_NOT_FOUND')
         finally:
@@ -233,8 +310,46 @@ class AnalysisApiTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_http_requires_scope_and_never_lists_another_guilds_reports(self):
+        server = create_server(self.root, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f'http://127.0.0.1:{server.server_port}/api/v1'
+        try:
+            with urlopen(base + '/health') as response:
+                self.assertEqual(json.load(response)['status'], 'ok')
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(base + '/reports')
+            self.assertEqual(raised.exception.code, 400)
+            self.assertEqual(
+                json.load(raised.exception)['error']['code'], 'GUILD_SCOPE_REQUIRED')
+
+            with urlopen(guild_request(base + '/reports')) as response:
+                own = json.load(response)
+            self.assertEqual(
+                [report['report_id'] for report in own['reports']], ['ApiTest01'])
+
+            other = Request(
+                base + '/reports', headers={'X-Carter-Guild-ID': '987654321'},
+            )
+            with urlopen(other) as response:
+                self.assertEqual(json.load(response)['reports'], [])
+            cross_guild = Request(
+                base + '/reports/ApiTest01',
+                headers={'X-Carter-Guild-ID': '987654321'},
+            )
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(cross_guild)
+            self.assertEqual(raised.exception.code, 404)
+            self.assertEqual(
+                json.load(raised.exception)['error']['code'], 'REPORT_NOT_FOUND')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_timer_export_endpoint(self):
-        drafts = self.root / 'mechanic-drafts'
+        drafts = self.guild_root / 'mechanic-drafts'
         drafts.mkdir()
         (drafts / 'sample-draft.json').write_text(
             json.dumps(sample_draft()), encoding='utf-8')
@@ -244,7 +359,7 @@ class AnalysisApiTests(unittest.TestCase):
         try:
             url = (f'http://127.0.0.1:{server.server_port}/api/v1/'
                    'mechanic-drafts/sample-draft/timer-export')
-            with urlopen(url) as response:
+            with urlopen(guild_request(url)) as response:
                 payload = json.load(response)
             self.assertEqual(payload['format'], 'wow-fight-timer/v1')
             self.assertEqual(payload['triggers']['start']['emit']['type'], 'FIGHT_ENGAGED')

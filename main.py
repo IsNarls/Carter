@@ -16,7 +16,9 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+from analysis_backend_control import AnalysisBackendController
 from analysis_client import AnalysisClient, AnalysisClientError, AnalysisClientSettings
+from audio import PCMPlayback
 from discord_receive import CarterVoiceClient
 from providers import ProviderError, ProviderSettings, generate_text
 from raid_integration import (
@@ -81,16 +83,35 @@ def analysis_configuration():
     return settings, env_bool("CARTER_ANALYSIS_LOG_CHANNEL_INGEST", True)
 
 
+def analysis_backend_configuration(settings):
+    """Return Carter-owned backend lifecycle settings without exposing credentials."""
+    managed = env_bool("CARTER_ANALYSIS_MANAGE_BACKEND", True)
+    startup_timeout = bounded_int("CARTER_ANALYSIS_STARTUP_TIMEOUT", 15, 1, 120)
+    health_interval = bounded_int("CARTER_ANALYSIS_HEALTH_INTERVAL", 15, 5, 300)
+    return bool(settings.enabled and managed), startup_timeout, health_interval
+
+
 def ai_configuration(*, analysis_tools=False):
     if os.getenv("CARTER_AI_PROVIDER", "gemini").strip().lower() != "gemini":
         raise ConfigurationError("CARTER_AI_PROVIDER must be gemini; OpenAI is opt-in fallback only")
     fallback = os.getenv("CARTER_ALLOW_OPENAI_FALLBACK", "false").strip().lower()
     if fallback not in {"true", "false"}:
         raise ConfigurationError("CARTER_ALLOW_OPENAI_FALLBACK must be true or false")
+    text_thinking = os.getenv(
+        "CARTER_GEMINI_TEXT_THINKING_LEVEL", "minimal",
+    ).strip().lower()
+    if text_thinking not in {"minimal", "low", "medium", "high"}:
+        raise ConfigurationError(
+            "CARTER_GEMINI_TEXT_THINKING_LEVEL must be minimal, low, medium, or high"
+        )
     settings = ProviderSettings(
         gemini_key=os.getenv("CARTER_GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("CARTER_GEMINI_MODEL", "gemini-3.8-live").strip(),
-        gemini_text_model=os.getenv("CARTER_GEMINI_TEXT_MODEL", "gemini-3.8-flash").strip(),
+        gemini_text_model=os.getenv(
+            "CARTER_GEMINI_TEXT_MODEL", "gemini-3.5-flash-lite",
+        ).strip(),
+        gemini_text_thinking_level=text_thinking,
+        gemini_text_timeout=bounded_int("CARTER_GEMINI_TEXT_TIMEOUT", 20, 5, 120),
         openai_key=os.getenv("CARTER_OPENAI_API_KEY", "").strip(),
         openai_model=os.getenv("CARTER_OPENAI_MODEL", "gpt-realtime-2.1").strip(),
         gemini_voice=os.getenv("CARTER_GEMINI_VOICE", "Kore").strip(),
@@ -114,6 +135,7 @@ class GuildRuntime:
         self.channel_id = _saved_id(record.get("voice_channel_id"))
         self.logs_channel_id = _saved_id(record.get("logs_channel_id"))
         self.analysis_state = GuildSettingsStore.analysis_state(record)
+        self.raid = RaidAnalysis(bot.analysis_client.for_guild(self.guild_id))
         self.voice_lock = asyncio.Lock()
         self.text_lock = asyncio.Lock()
         self.analysis_lock = asyncio.Lock()
@@ -127,16 +149,23 @@ class GuildRuntime:
             return await bot._wake_activate(self, user_id, voice, generation)
 
         self.wake = WakeListener(self.session, bot.allowed_users, wake_settings, on_wake)
+
+        async def rearm_after_exchange():
+            await bot._rearm_after_exchange(self)
+
+        self.session.completion_handler = rearm_after_exchange
         self.want_voice = False
         self.import_tasks: set[asyncio.Task] = set()
         self.importing: dict[str, asyncio.Task] = {}
         self.history_import_task: asyncio.Task | None = None
+        self.replay_active = False
 
 
 class Carter(discord.Client):
     def __init__(self, legacy_guild_id, allowed_users, settings=None, limits=SessionLimits(),
                  wake_settings=None, analysis_settings=AnalysisClientSettings(), *,
-                 monitor_log_channel=True):
+                 monitor_log_channel=True, backend_controller=None,
+                 backend_health_interval=15):
         settings = settings or ProviderSettings()
         wake_settings = wake_settings or WakeSettings(auto_join=False)
         intents = discord.Intents.none()
@@ -153,8 +182,11 @@ class Carter(discord.Client):
         self.wake_settings = wake_settings
         self.analysis_settings = analysis_settings
         self.monitor_log_channel = bool(monitor_log_channel)
+        self.backend_controller = backend_controller
+        self.backend_health_interval = max(5, int(backend_health_interval))
+        self.backend_supervisor_task = None
+        self.backend_recovery_lock = asyncio.Lock()
         self.analysis_client = AnalysisClient(analysis_settings)
-        self.raid = RaidAnalysis(self.analysis_client)
         self.settings_store = GuildSettingsStore(DATA_ROOT / "guild-settings.json")
         self.guilds_runtime: dict[int, GuildRuntime] = {}
         # The backend intentionally has one import worker. Serializing Carter's
@@ -166,8 +198,11 @@ class Carter(discord.Client):
         carter.command(name="join", description="Join this server's selected voice channel")(self.join)
         carter.command(name="leave", description="Leave voice")(self.leave)
         carter.command(name="status", description="Show Carter connection status")(self.status)
-        carter.command(name="activate", description="Start a voice conversation")(self.activate)
+        carter.command(name="activate", description="Start one voice request and response")(self.activate)
         carter.command(name="stop", description="Stop AI speech and listening")(self.stop_ai)
+        carter.command(name="replay", description="Replay Carter's latest voice response")(
+            self.replay,
+        )
         carter.command(name="ask", description="Ask Carter in text")(self.ask)
         carter.command(name="setvoice", description="Save this server's voice channel")(
             self.set_voice_channel,
@@ -215,6 +250,9 @@ class Carter(discord.Client):
             self.logs_import,
         )
         logs.command(name="job", description="Check a backend import job")(self.logs_job)
+        logs.command(name="reset", description="Clear this server's Warcraft Logs import data")(
+            self.logs_reset,
+        )
         self.tree.add_command(logs)
         self.tree.on_error = self.command_error
 
@@ -229,6 +267,47 @@ class Carter(discord.Client):
                 if error.code != 50001:
                     raise
                 log.info("Legacy guild command cleanup skipped (missing access)")
+        if self.backend_controller is not None and self.backend_supervisor_task is None:
+            self.backend_supervisor_task = asyncio.create_task(
+                self._supervise_analysis_backend(), name="carter-analysis-backend",
+            )
+
+    async def _supervise_analysis_backend(self):
+        """Restart Carter's local backend if its health endpoint stops responding."""
+        while True:
+            await asyncio.sleep(self.backend_health_interval)
+            try:
+                await self.analysis_client.health()
+                continue
+            except AnalysisClientError as error:
+                log.warning("Raid analysis backend health check failed: %s", error.code)
+            result = await self._recover_analysis_backend()
+            if result.ok:
+                log.info("Raid analysis backend recovered: %s", result.code)
+            else:
+                log.error("Raid analysis backend recovery failed: %s", result.code)
+
+    async def _recover_analysis_backend(self):
+        """Serialize local backend recovery so Discord and the supervisor cannot race."""
+        if self.backend_controller is None:
+            return None
+        async with self.backend_recovery_lock:
+            return await asyncio.to_thread(self.backend_controller.ensure_running)
+
+    async def _analysis_request(self, operation):
+        """Retry one request after recovering Carter's managed loopback backend."""
+        try:
+            return await operation()
+        except AnalysisClientError as error:
+            if error.code != "analysis_unavailable" or self.backend_controller is None:
+                raise
+            result = await self._recover_analysis_backend()
+            if result is None or not result.ok:
+                code = result.code if result is not None else "not_managed"
+                log.error("On-demand raid analysis recovery failed: %s", code)
+                raise
+            log.info("On-demand raid analysis backend recovery: %s", result.code)
+            return await operation()
 
     def runtime(self, guild_id):
         guild_id = int(guild_id)
@@ -295,6 +374,30 @@ class Carter(discord.Client):
             log.warning("Wake setup failed: %s; run .venv/bin/python setup_wakeword.py",
                         type(error).__name__)
 
+    async def _rearm_after_exchange(self, state):
+        """Return a completed one-response exchange to local wake-only mode."""
+        async with state.voice_lock:
+            guild = self.get_guild(state.guild_id)
+            voice = (getattr(state.session, "voice", None)
+                     or getattr(state.wake, "voice", None)
+                     or (getattr(guild, "voice_client", None) if guild else None))
+            if (not state.want_voice or not voice or not voice.is_connected()
+                    or not voice.channel or voice.channel.id != state.channel_id):
+                return
+            if state.wake.running and state.wake.voice is voice:
+                state.wake.reset()
+                log.info(
+                    "One-response exchange finished; wake listener rearmed for '%s'",
+                    state.wake.settings.word,
+                )
+                return
+            await self._arm_wake(state, voice)
+            if state.wake.state == "armed":
+                log.info(
+                    "One-response exchange finished; wake listener restarted for '%s'",
+                    state.wake.settings.word,
+                )
+
     async def _connect_voice(self, state, guild, channel):
         voice = guild.voice_client
         if not voice or not voice.is_connected():
@@ -314,6 +417,7 @@ class Carter(discord.Client):
             if (generation != state.wake.generation or not state.wake.running
                     or state.wake.voice is not voice or not voice.is_connected()
                     or voice.channel.id != state.channel_id or state.session.active
+                    or state.replay_active
                     or user_id not in self.allowed_users):
                 return False
             member = voice.guild.get_member(user_id)
@@ -341,8 +445,10 @@ class Carter(discord.Client):
             return {"error": "unauthorized"}
         try:
             async with state.analysis_lock:
-                answer = await self.raid.execute_tool(
-                    state.analysis_state, call.get("arguments") or {}, owner_id,
+                answer = await self._analysis_request(
+                    lambda: state.raid.execute_tool(
+                        state.analysis_state, call.get("arguments") or {}, owner_id,
+                    ),
                 )
                 self.save_runtime(state)
             if answer.image:
@@ -376,8 +482,10 @@ class Carter(discord.Client):
         async with state.text_lock:
             if self.analysis_settings.enabled:
                 try:
-                    answer = await self.raid.answer_question(
-                        state.analysis_state, prompt, interaction.user.id,
+                    answer = await self._analysis_request(
+                        lambda: state.raid.answer_question(
+                            state.analysis_state, prompt, interaction.user.id,
+                        ),
                     )
                     if answer is not None:
                         self.save_runtime(state)
@@ -578,7 +686,7 @@ class Carter(discord.Client):
                 return
             await notice(
                 f"Carter is listening only to your microphone using {state.session.provider_name}. "
-                "Others can hear replies. Use `/carter stop` to end."
+                "Others can hear the one reply; then wake listening rearms automatically."
             )
 
     async def stop_ai(self, interaction: discord.Interaction):
@@ -593,6 +701,56 @@ class Carter(discord.Client):
                 message += f" Say '{state.wake.settings.word}' to wake Carter again."
             await interaction.followup.send(message, ephemeral=True)
 
+    async def replay(self, interaction: discord.Interaction):
+        if not await self.authorize(interaction):
+            return
+        state = self.runtime(interaction.guild_id)
+        async with state.voice_lock:
+            voice = interaction.guild.voice_client
+            member_voice = getattr(interaction.user, "voice", None)
+            if not voice or not voice.is_connected() or not isinstance(voice, CarterVoiceClient):
+                await interaction.followup.send("Use `/carter join` first.", ephemeral=True)
+                return
+            if (not member_voice or not member_voice.channel
+                    or member_voice.channel.id != state.channel_id
+                    or voice.channel.id != state.channel_id):
+                await interaction.followup.send(
+                    "Join the saved voice channel first.", ephemeral=True,
+                )
+                return
+            if state.session.active or state.replay_active:
+                await interaction.followup.send(
+                    "Carter is already speaking or listening.", ephemeral=True,
+                )
+                return
+            pcm = state.session.replay_audio()
+            if not pcm:
+                await interaction.followup.send(
+                    "There is no recent Carter response to replay.", ephemeral=True,
+                )
+                return
+
+            state.replay_active = True
+            state.wake.reset(cooldown=30)
+            playback = PCMPlayback()
+            try:
+                voice.play(playback)
+                playback.push(pcm)
+                playback.finish_turn()
+                await interaction.followup.send(
+                    "Replaying Carter's latest response without using AI tokens.",
+                    ephemeral=True,
+                )
+                deadline = time.monotonic() + 25
+                while (voice.is_connected() and not playback.is_idle()
+                       and time.monotonic() < deadline):
+                    await asyncio.sleep(0.05)
+            finally:
+                voice.stop()
+                playback.cleanup()
+                state.replay_active = False
+                state.wake.reset(cooldown=1)
+
     async def leave(self, interaction: discord.Interaction):
         if not await self.authorize(interaction):
             return
@@ -601,6 +759,7 @@ class Carter(discord.Client):
             state.want_voice = False
             await state.wake.stop()
             await state.session.stop()
+            state.session.clear_replay()
             if interaction.guild.voice_client:
                 await interaction.guild.voice_client.disconnect(force=True)
             await interaction.followup.send("Carter is disconnected.", ephemeral=True)
@@ -641,7 +800,7 @@ class Carter(discord.Client):
         if not await self.authorize(interaction):
             return
         try:
-            result = await self.analysis_client.health()
+            result = await self._analysis_request(self.analysis_client.health)
             await interaction.followup.send(
                 f"Analysis backend: {result.get('status', 'ready')}; schema "
                 f"{result.get('schema_version', 'unknown')}.", ephemeral=True,
@@ -651,19 +810,20 @@ class Carter(discord.Client):
 
     async def logs_reports(self, interaction: discord.Interaction,
                            limit: app_commands.Range[int, 1, 20] = 10):
-        await self._analysis_command(interaction, lambda _state: self.raid.reports(limit))
+        await self._analysis_command(interaction, lambda state: state.raid.reports(limit))
 
     async def logs_fights(self, interaction: discord.Interaction, report_id: str = ""):
         await self._analysis_command(
-            interaction, lambda state: self.raid.fights(state, report_id or None),
+            interaction,
+            lambda state: state.raid.fights(state.analysis_state, report_id or None),
         )
 
     async def logs_select(self, interaction: discord.Interaction, report_id: str,
                           fight_id: app_commands.Range[int, 1] | None = None):
         async def select(state):
-            answer = await self.raid.select_report(state, report_id)
+            answer = await state.raid.select_report(state.analysis_state, report_id)
             if fight_id is not None:
-                answer = await self.raid.select_fight(state, fight_id)
+                answer = await state.raid.select_fight(state.analysis_state, fight_id)
             return answer
         await self._analysis_command(interaction, select, save=True)
 
@@ -672,40 +832,44 @@ class Carter(discord.Client):
                           attempt: app_commands.Range[int, 1] | None = None):
         async def select(state):
             if source == "live":
-                return await self.raid.select_live(state, attempt)
-            state.source, state.live_attempt = "stored", None
-            resolved = await self.raid.resolve_source(state, "")
+                return await state.raid.select_live(state.analysis_state, attempt)
+            state.analysis_state.source, state.analysis_state.live_attempt = "stored", None
+            resolved = await state.raid.resolve_source(state.analysis_state, "")
             return RaidAnswer(f"Selected stored analysis: {resolved.label}.")
         await self._analysis_command(interaction, select, save=True)
 
     async def logs_summary(self, interaction: discord.Interaction):
-        await self._analysis_command(interaction, lambda state: self.raid.summary(state))
+        await self._analysis_command(
+            interaction, lambda state: state.raid.summary(state.analysis_state),
+        )
 
     async def logs_ranking(self, interaction: discord.Interaction,
                            metric: Literal["dps", "hps"] = "dps",
                            limit: app_commands.Range[int, 1, 20] = 10):
         await self._analysis_command(
-            interaction, lambda state: self.raid.ranking(state, metric, limit),
+            interaction,
+            lambda state: state.raid.ranking(state.analysis_state, metric, limit),
         )
 
     async def logs_player(self, interaction: discord.Interaction,
                           player: app_commands.Range[str, 1, 100]):
         await self._analysis_command(
-            interaction, lambda state: self.raid.player(state, player),
+            interaction, lambda state: state.raid.player(state.analysis_state, player),
         )
 
     async def logs_death(self, interaction: discord.Interaction, player: str = "",
                          death_number: app_commands.Range[int, 1] | None = None):
         async def explain(state):
-            name = player.strip() or state.identities.get(str(interaction.user.id), "")
+            analysis = state.analysis_state
+            name = player.strip() or analysis.identities.get(str(interaction.user.id), "")
             if not name:
                 raise AnalysisClientError("identity_required")
-            return await self.raid.death(state, name, death_number)
+            return await state.raid.death(analysis, name, death_number)
         await self._analysis_command(interaction, explain)
 
     async def logs_deaths(self, interaction: discord.Interaction):
         await self._analysis_command(
-            interaction, lambda state: self.raid.death_timeline(state),
+            interaction, lambda state: state.raid.death_timeline(state.analysis_state),
         )
 
     async def logs_identity(self, interaction: discord.Interaction,
@@ -784,7 +948,8 @@ class Carter(discord.Client):
         )
 
     async def logs_import(self, interaction: discord.Interaction,
-                          report_url: app_commands.Range[str, 1, 500]):
+                          report_url: app_commands.Range[str, 1, 500],
+                          refresh: bool = False):
         if not await self.authorize(interaction):
             return
         state = self.runtime(interaction.guild_id)
@@ -805,7 +970,7 @@ class Carter(discord.Client):
             return
         await self.import_lock.acquire()
         try:
-            queued = await self.raid.submit_report(match.group(0))
+            queued = await state.raid.submit_report(match.group(0), refresh=refresh)
         except AnalysisClientError as error:
             self.import_lock.release()
             await interaction.followup.send(user_error(error), ephemeral=True)
@@ -846,11 +1011,63 @@ class Carter(discord.Client):
                        job_id: app_commands.Range[str, 1, 100]):
         if not await self.authorize(interaction):
             return
+        state = self.runtime(interaction.guild_id)
         try:
-            payload = await self.analysis_client.import_job(job_id)
+            payload = await state.raid.client.import_job(job_id)
             await interaction.followup.send(_format_job(payload), ephemeral=True)
         except AnalysisClientError as error:
             await interaction.followup.send(user_error(error), ephemeral=True)
+
+    async def logs_reset(self, interaction: discord.Interaction, confirm: bool):
+        """Clear only this guild's downloaded reports and import history."""
+        is_admin = bool(getattr(
+            getattr(interaction.user, "guild_permissions", None), "administrator", False,
+        ))
+        if interaction.guild_id is None or not is_admin:
+            await interaction.response.send_message(
+                "Only a server administrator can reset Warcraft Logs data.",
+                ephemeral=True,
+            )
+            return
+        if not confirm:
+            await interaction.response.send_message(
+                "No data was deleted. Run `/logs reset confirm:True` to remove this server's "
+                "downloaded report caches, analyses, partial-download checkpoints, and import "
+                "history. Other servers and Carter settings are not affected.",
+                ephemeral=True,
+            )
+            return
+
+        state = self.runtime(interaction.guild_id)
+        if (self.import_lock.locked()
+                or any(not task.done() for task in state.import_tasks)):
+            await interaction.response.send_message(
+                "A report import is still active or queued. Wait for it to finish before resetting.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await state.raid.client.reset_import_data()
+        except AnalysisClientError as error:
+            if error.code == "IMPORTS_ACTIVE":
+                message = (
+                    "A report import is still active or queued on the backend. "
+                    "Wait for it to finish before resetting."
+                )
+            else:
+                message = user_error(error)
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"Reset complete for this server: removed data for "
+            f"{int(result.get('reports_removed') or 0)} report(s), including cached reports, "
+            f"analysis files, partial-download checkpoints, and retained import history. "
+            "Carter settings and other servers' data were not changed.",
+            ephemeral=True,
+        )
 
     async def _analysis_command(self, interaction, operation, *, save=False):
         if not await self.authorize(interaction, ephemeral=False):
@@ -858,7 +1075,7 @@ class Carter(discord.Client):
         state = self.runtime(interaction.guild_id)
         try:
             async with state.analysis_lock:
-                answer = await operation(state.analysis_state)
+                answer = await self._analysis_request(lambda: operation(state))
                 if save:
                     self.save_runtime(state)
             await self._send_interaction_answer(interaction, answer)
@@ -1009,7 +1226,7 @@ class Carter(discord.Client):
         try:
             async with self.import_lock:
                 try:
-                    queued = await self.raid.submit_report(url)
+                    queued = await state.raid.submit_report(url)
                     job_id = str(queued.tool_context["job_id"])
                     await self._poll_import(state, job_id, report_id, channel)
                 except AnalysisClientError as error:
@@ -1041,9 +1258,9 @@ class Carter(discord.Client):
             deadline = time.monotonic() + 1800
             payload = {}
             while time.monotonic() < deadline:
-                payload = await self.analysis_client.import_job(job_id)
+                payload = await state.raid.client.import_job(job_id)
                 status = str(payload.get("status") or payload.get("state") or "").casefold()
-                if status in {"succeeded", "partial", "failed"}:
+                if status in {"succeeded", "partial", "failed", "rate_limited"}:
                     break
                 await asyncio.sleep(2)
             else:
@@ -1052,7 +1269,12 @@ class Carter(discord.Client):
             errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
             first_error = errors[0] if errors and isinstance(errors[0], dict) else {}
             if status not in {"succeeded", "partial"}:
-                raise AnalysisClientError(str(first_error.get("code") or "import_failed"))
+                details = {key: first_error[key] for key in (
+                    "checkpoint_saved", "retryable", "retry_after_seconds",
+                ) if key in first_error}
+                raise AnalysisClientError(
+                    str(first_error.get("code") or "import_failed"), details=details,
+                )
             result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
             state.analysis_state.source = "stored"
             state.analysis_state.report_id = str(
@@ -1065,6 +1287,7 @@ class Carter(discord.Client):
                     f"Prepared Warcraft Logs report `{state.analysis_state.report_id}`: "
                     f"{int(result.get('analyzed_fights') or 0)} of "
                     f"{int(result.get('fight_count') or 0)} fight analyses available"
+                    f"{' (local cache reused)' if result.get('cache_hit') else ''}"
                     f"{' (partial)' if status == 'partial' else ''}.",
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
@@ -1081,10 +1304,19 @@ class Carter(discord.Client):
         )
         if isinstance(channel, discord.abc.Messageable):
             try:
-                await channel.send(
-                    f"Could not prepare report `{report_id}` ({error.code}).",
-                    allowed_mentions=discord.AllowedMentions.none(),
+                message = (
+                    (f"Warcraft Logs rate limit reached for `{report_id}`. Downloaded pages were "
+                     "saved; run the import again later to resume.")
+                    if error.code == "RATE_LIMITED" and error.details.get("checkpoint_saved") else
+                    (f"Warcraft Logs rate limit reached for `{report_id}` before a page could be "
+                     "saved; retry the import later.")
+                    if error.code == "RATE_LIMITED" else
+                    (f"Import interrupted for `{report_id}`. Downloaded pages were saved; run the "
+                     "import again to resume.")
+                    if error.code == "DOWNLOAD_FAILED" and error.details.get("checkpoint_saved") else
+                    f"Could not prepare report `{report_id}` ({error.code})."
                 )
+                await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 pass
 
@@ -1140,6 +1372,10 @@ class Carter(discord.Client):
 
     async def close(self):
         try:
+            if self.backend_supervisor_task is not None:
+                self.backend_supervisor_task.cancel()
+                await asyncio.gather(self.backend_supervisor_task, return_exceptions=True)
+                self.backend_supervisor_task = None
             for state in self.guilds_runtime.values():
                 for task in list(state.import_tasks):
                     task.cancel()
@@ -1148,6 +1384,10 @@ class Carter(discord.Client):
                 await state.wake.stop()
                 await state.session.stop()
             await self.analysis_client.close()
+            if self.backend_controller is not None:
+                result = await asyncio.to_thread(self.backend_controller.stop)
+                if not result.ok:
+                    log.warning("Raid analysis backend cleanup failed: %s", result.code)
             for voice in list(self.voice_clients):
                 try:
                     await voice.disconnect(force=True)
@@ -1272,6 +1512,8 @@ def main():
         raise ConfigurationError("CARTER_ALLOWED_USER_IDS requires positive Discord user IDs")
     users = {int(user.strip()) for user in raw_users}
     analysis_settings, monitor = analysis_configuration()
+    manage_backend, backend_startup_timeout, backend_health_interval = \
+        analysis_backend_configuration(analysis_settings)
     settings, limits = ai_configuration(analysis_tools=analysis_settings.enabled)
     with (ROOT / ".carter.lock").open("a+") as lock:
         try:
@@ -1282,13 +1524,34 @@ def main():
         lock.truncate()
         lock.write(f"{os.getpid()}\n")
         lock.flush()
+        backend_controller = None
         try:
+            if manage_backend:
+                try:
+                    backend_controller = AnalysisBackendController(
+                        analysis_settings.base_url, ROOT,
+                        startup_timeout=backend_startup_timeout,
+                    )
+                except ValueError as error:
+                    raise ConfigurationError(str(error)) from None
+                backend_result = backend_controller.ensure_running()
+                if not backend_result.ok:
+                    raise RuntimeError(
+                        f"Raid analysis backend startup failed: {backend_result.code}"
+                    )
+                log.info("Raid analysis backend lifecycle ready: %s", backend_result.code)
             bot = Carter(
                 legacy_guild_id, users, settings, limits, wake_configuration(),
                 analysis_settings, monitor_log_channel=monitor,
+                backend_controller=backend_controller,
+                backend_health_interval=backend_health_interval,
             )
             bot.run(token, log_handler=None)
         finally:
+            if backend_controller is not None:
+                backend_result = backend_controller.stop()
+                if not backend_result.ok:
+                    log.warning("Raid analysis backend cleanup failed: %s", backend_result.code)
             lock.seek(0)
             lock.truncate()
             lock.flush()

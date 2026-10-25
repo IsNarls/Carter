@@ -2,20 +2,31 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 if __package__:
     from .encounter_parser import EncounterRef
     from .wow_log_gui import (fight_module_catalog, filter_checked_report_paths,
-                              group_cross_report_encounters, newest_report_keys,
+                              group_cross_report_encounters, guild_data_directory,
+                              newest_report_keys,
                               prepare_fight_module, report_modified_text, report_path_key,
-                              selectable_report_paths, validate_learner_selection)
+                              read_console_update, redact_console_text, saved_guild_ids,
+                              import_update_is_active,
+                              parse_warcraft_import_progress, warcraft_import_progress_lines,
+                              selectable_report_paths,
+                              validate_learner_selection)
 else:
     from encounter_parser import EncounterRef
     from wow_log_gui import (fight_module_catalog, filter_checked_report_paths,
-                             group_cross_report_encounters, newest_report_keys,
+                             group_cross_report_encounters, guild_data_directory,
+                             newest_report_keys,
                              prepare_fight_module, report_modified_text, report_path_key,
-                             selectable_report_paths, validate_learner_selection)
+                             read_console_update, redact_console_text, saved_guild_ids,
+                             import_update_is_active,
+                             parse_warcraft_import_progress, warcraft_import_progress_lines,
+                             selectable_report_paths,
+                             validate_learner_selection)
 
 
 def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
@@ -32,6 +43,94 @@ def encounter(attempt, encounter_id=3429, difficulty=4, external_id=None):
 
 
 class GuiLearnerSelectionTests(unittest.TestCase):
+    def test_console_reader_tails_incrementally_and_handles_truncation(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            path = Path(folder) / 'carter.log'
+            path.write_text('first line\n', encoding='utf-8')
+
+            first, offset, reset = read_console_update(path)
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write('second line\n')
+            second, offset, second_reset = read_console_update(path, offset)
+            path.write_text('new\n', encoding='utf-8')
+            third, _, third_reset = read_console_update(path, offset)
+
+            self.assertEqual(first, 'first line\n')
+            self.assertTrue(reset)
+            self.assertEqual(second, 'second line\n')
+            self.assertFalse(second_reset)
+            self.assertEqual(third, 'new\n')
+            self.assertTrue(third_reset)
+
+    def test_console_reader_keeps_only_bounded_recent_complete_lines(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            path = Path(folder) / 'carter.log'
+            path.write_text('old line\nmiddle line\nnewest line\n', encoding='utf-8')
+
+            content, offset, reset = read_console_update(path, max_bytes=24)
+
+            self.assertTrue(reset)
+            self.assertEqual(offset, path.stat().st_size)
+            self.assertNotIn('old line', content)
+            self.assertIn('newest line', content)
+
+    def test_console_redacts_common_secret_shapes(self):
+        google_key = 'AIza' + ('A' * 35)
+        discord_token = ('A' * 24) + '.' + ('B' * 6) + '.' + ('C' * 30)
+        source = (f'CARTER_GEMINI_API_KEY={google_key}\n'
+                  f'Authorization: Bearer bearer-secret\nDiscord token={discord_token}\n')
+
+        result = redact_console_text(source)
+
+        self.assertNotIn(google_key, result)
+        self.assertNotIn('bearer-secret', result)
+        self.assertNotIn(discord_token, result)
+        self.assertGreaterEqual(result.count('[redacted'), 3)
+
+    def test_warcraft_console_keeps_only_backend_import_progress(self):
+        lines = (
+            "backend startup complete\n"
+            '2026-10-23T12:00:00+00:00 WCL_IMPORT_PROGRESS '
+            '{"report_id":"AbCd1234","status":"running","stage":"download",'
+            '"progress":{"percent":null,"completed_fights":0,"total_fights":null,'
+            '"message":"Downloading pull 1/4"},"errors":[]}\n'
+            "backend request completed\n"
+        )
+
+        filtered = warcraft_import_progress_lines(lines)
+        updates = parse_warcraft_import_progress(filtered)
+
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["report_id"], "AbCd1234")
+        self.assertEqual(updates[0]["status"], "running")
+        self.assertEqual(updates[0]["progress"]["percent"], None)
+        self.assertEqual(updates[0]["_logged_at"], "2026-10-23T12:00:00+00:00")
+
+    def test_old_unfinished_import_snapshot_is_not_active_after_restart(self):
+        now = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
+        update = {
+            'status': 'running',
+            '_logged_at': (now - timedelta(minutes=6)).isoformat(),
+        }
+        self.assertFalse(import_update_is_active(update, now))
+        update['_logged_at'] = (now - timedelta(seconds=30)).isoformat()
+        self.assertTrue(import_update_is_active(update, now))
+
+    def test_live_token_storage_uses_valid_saved_guild_scope(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            root = Path(folder)
+            settings = root / 'guild-settings.json'
+            settings.write_text(json.dumps({
+                'guilds': {'123456789': {'logs_channel_id': 10}, '../bad': {}},
+            }), encoding='utf-8')
+            self.assertEqual(saved_guild_ids(settings), ['123456789'])
+            self.assertEqual(
+                guild_data_directory(root / 'data', '123456789'),
+                (root / 'data' / 'guilds' / '123456789').resolve(),
+            )
+            with self.assertRaises(ValueError):
+                guild_data_directory(root / 'data', '../bad')
+
     def test_selectable_reports_only_returns_wcl_caches_newest_first(self):
         with tempfile.TemporaryDirectory(dir='.') as folder:
             root = Path(folder)

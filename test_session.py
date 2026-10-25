@@ -4,7 +4,7 @@ import struct
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from audio import PCMPlayback
 from providers import ProviderError, ProviderEvent
@@ -185,6 +185,97 @@ class VoiceSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(frame))
         self.assertAlmostEqual(session.output_seconds, 0.02)
 
+    async def test_one_response_closes_exchange_after_playback_and_ignores_followup(self):
+        provider, voice = FakeProvider(), FakeVoice()
+        shared_sink = SimpleNamespace(cleanup=Mock())
+        voice.sink, voice.listening = shared_sink, True
+        session, _ = self.make(provider)
+        await session.start(voice, 42, external_capture=True)
+        session.capture(42, MIC_FRAME)
+        await eventually(lambda: provider.ends == 1, timeout=1.2)
+
+        frames_before_followup = session.input_frames
+        session.capture(42, MIC_FRAME)
+        await REAL_SLEEP(0.03)
+        self.assertFalse(session.accept_audio)
+        self.assertEqual(session.input_frames, frames_before_followup)
+        self.assertEqual(provider.starts, 1)
+
+        provider.events.put_nowait(ProviderEvent(
+            "audio", struct.pack("<h", 1200) * 960,
+        ))
+        provider.events.put_nowait(ProviderEvent("turn_complete"))
+        await eventually(lambda: session.response_complete.is_set())
+        self.assertTrue(session.active)
+        while not session.playback.is_idle():
+            session.playback.read()
+        await eventually(lambda: not session.active)
+        await session.task
+
+        self.assertEqual(session.reason, "response_complete")
+        self.assertEqual(session.speech_turns, 1)
+        self.assertEqual(session.output_seconds, 0.04)
+        self.assertTrue(voice.connected)
+        self.assertTrue(voice.listening)
+        self.assertFalse(voice.playing)
+        shared_sink.cleanup.assert_not_called()
+        self.assertGreaterEqual(provider.closes, 1)
+        self.assertTrue(session.replay_audio())
+
+    async def test_replay_buffer_expires_and_can_be_cleared(self):
+        session, _ = self.make(FakeProvider())
+        session.last_response_pcm = b"response"
+        session.last_response_at = time.monotonic() - 601
+        self.assertEqual(session.replay_audio(), b"")
+        session.last_response_pcm = b"response"
+        session.last_response_at = time.monotonic()
+        session.clear_replay()
+        self.assertEqual(session.replay_audio(), b"")
+
+    async def test_completed_exchange_calls_automatic_rearm_handler(self):
+        provider, voice = FakeProvider(), FakeVoice()
+        rearmed = asyncio.Event()
+        session, _ = self.make(provider)
+
+        async def rearm():
+            rearmed.set()
+
+        session.completion_handler = rearm
+        await session.start(voice, 42)
+        provider.events.put_nowait(ProviderEvent("turn_complete"))
+        await eventually(lambda: not session.active)
+        await session.task
+
+        self.assertEqual(session.reason, "response_complete")
+        self.assertTrue(rearmed.is_set())
+
+    async def test_explicit_stop_does_not_call_automatic_rearm_handler(self):
+        provider, voice = FakeProvider(), FakeVoice()
+        rearmed = AsyncMock()
+        session, _ = self.make(provider)
+        session.completion_handler = rearmed
+        await session.start(voice, 42)
+        await session.stop()
+
+        rearmed.assert_not_awaited()
+
+    async def test_provider_failure_after_answer_audio_never_reconnects_for_second_response(self):
+        provider = FakeProvider()
+        session, factory = self.make(provider)
+        await session.start(FakeVoice(), 42)
+        provider.events.put_nowait(ProviderEvent(
+            "audio", struct.pack("<h", 1200) * 480,
+        ))
+        provider.events.put_nowait(ProviderError("connection_lost", transient=True))
+
+        await eventually(lambda: not session.active)
+        await session.task
+
+        self.assertEqual(factory.names, ["gemini"])
+        self.assertEqual(session.reason, "error")
+        self.assertEqual(session.last_error, "connection_lost")
+        self.assertGreaterEqual(provider.closes, 1)
+
     async def test_tool_call_is_bounded_and_returned_to_same_provider(self):
         provider = FakeProvider()
         calls = []
@@ -211,6 +302,42 @@ class VoiceSessionTests(unittest.IsolatedAsyncioTestCase):
             provider.tool_results[0][0]["response"]["text"], "Prepared evidence",
         )
         self.assertEqual(session.tool_calls, 1)
+
+    async def test_tool_turn_boundary_waits_for_spoken_followup(self):
+        provider = FakeProvider()
+
+        async def handle(_call):
+            return {"text": "Prepared evidence"}
+
+        session = VoiceSession(
+            SimpleNamespace(connect_timeout=0.1), SessionLimits(),
+            FakeFactory(provider), tool_handler=handle,
+        )
+        self.sessions.append(session)
+        await session.start(FakeVoice(), 42)
+        provider.events.put_nowait(ProviderEvent("tool_call", tool_calls=({
+            "id": "call-1", "name": "query_raid_analysis", "arguments": {},
+        },)))
+        provider.events.put_nowait(ProviderEvent("turn_complete"))
+        await eventually(lambda: bool(provider.tool_results))
+        await REAL_SLEEP(0.03)
+
+        self.assertTrue(session.active)
+        self.assertFalse(session.response_complete.is_set())
+        self.assertEqual(session.output_seconds, 0)
+
+        provider.events.put_nowait(ProviderEvent(
+            "audio", struct.pack("<h", 1200) * 960,
+        ))
+        provider.events.put_nowait(ProviderEvent("turn_complete"))
+        await eventually(lambda: session.response_complete.is_set())
+        while not session.playback.is_idle():
+            session.playback.read()
+        await eventually(lambda: not session.active)
+        await session.task
+
+        self.assertEqual(session.reason, "response_complete")
+        self.assertGreater(session.output_seconds, 0)
 
     async def test_extra_tool_calls_receive_bounded_errors(self):
         provider = FakeProvider()

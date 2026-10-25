@@ -7,6 +7,8 @@ No adapter reads environment files, selects a fallback, or records audio.
 import asyncio
 import base64
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal, Protocol
 from urllib.parse import urlencode
@@ -20,7 +22,9 @@ log = logging.getLogger("carter.providers")
 class ProviderSettings:
     gemini_key: str = field(default="", repr=False)
     gemini_model: str = "gemini-3.8-live"
-    gemini_text_model: str = "gemini-3.8-flash"
+    gemini_text_model: str = "gemini-3.5-flash-lite"
+    gemini_text_thinking_level: str = "minimal"
+    gemini_text_timeout: float = 20.0
     openai_key: str = field(default="", repr=False)
     openai_model: str = "gpt-realtime-2.1"
     gemini_voice: str = "Kore"
@@ -32,9 +36,10 @@ class ProviderSettings:
         "for raid-log facts and never invent unavailable results. Do not claim to execute "
         "actions that you did not perform. "
         "The selected user's microphone may also contain unrelated room or voice-channel "
-        "conversation. Respond only when that user clearly addresses Carter or gives a "
-        "follow-up in the active exchange; otherwise remain silent. Never answer speech "
-        "that is directed to another person. Respond only in English, regardless of the "
+        "conversation. Each activation is exactly one user request and one response. "
+        "Never invite or wait for a follow-up; Carter closes the AI exchange after your "
+        "first completed response. Never answer speech directed to another person. "
+        "Respond only in English, regardless of the "
         "language used in the question or source data. Preserve player, guild, encounter, "
         "and ability names exactly rather than translating proper names."
     )
@@ -68,14 +73,34 @@ async def generate_text(settings, prompt):
     """Run one bounded Gemini text turn, retrying one transient failure."""
     if not settings.gemini_key:
         raise ProviderError("missing_key")
+    model = _safe_model_label(settings.gemini_text_model)
     for attempt in range(2):
+        started = time.monotonic()
+        log.info("Gemini text request started: model=%s attempt=%s", model, attempt + 1)
         try:
-            return await _generate_text_once(settings, prompt)
+            answer = await _generate_text_once(settings, prompt)
         except ProviderError as error:
-            if not error.transient or attempt:
+            retry = bool(error.transient and not attempt)
+            log.warning(
+                "Gemini text request failed: model=%s attempt=%s code=%s "
+                "elapsed=%.2fs retry=%s",
+                model, attempt + 1, error.code, time.monotonic() - started, retry,
+            )
+            if not retry:
                 raise
-            log.warning("Gemini text request interrupted: code=%s; retrying once", error.code)
             await asyncio.sleep(1)
+        else:
+            log.info(
+                "Gemini text request completed: model=%s attempt=%s elapsed=%.2fs",
+                model, attempt + 1, time.monotonic() - started,
+            )
+            return answer
+
+
+def _safe_model_label(value):
+    """Return a log-safe model label without ever including arbitrary env text."""
+    value = str(value or '')
+    return value if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,127}', value) else 'configured_model'
 
 
 async def _generate_text_once(settings, prompt):
@@ -89,12 +114,14 @@ async def _generate_text_once(settings, prompt):
             config={
                 "max_output_tokens": 1024,
                 "system_instruction": settings.instructions,
+                "thinking_config": {
+                    "thinking_level": settings.gemini_text_thinking_level,
+                },
             },
-        ), settings.receive_timeout)
+        ), settings.gemini_text_timeout)
         answer = response.text.strip() if isinstance(response.text, str) else ""
         if not answer:
             raise ProviderError("empty_response")
-        log.info("Gemini text response completed")
         return answer
     except BaseException as error:
         if isinstance(error, asyncio.CancelledError):

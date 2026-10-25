@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import queue
+import re
 import statistics
 import threading
 import time
@@ -41,6 +42,148 @@ else:  # Support direct execution from this directory.
 def default_log() -> Path | None:
     logs = list(Path(__file__).parent.glob('*.txt'))
     return max(logs, key=lambda item: item.stat().st_mtime) if logs else None
+
+
+CONSOLE_READ_BYTES = 256 * 1024
+CONSOLE_MAX_CHARS = 300_000
+WARCRAFT_IMPORT_LOG_MARKER = 'WCL_IMPORT_PROGRESS '
+
+
+_CONSOLE_SECRET_PATTERNS = (
+    # Headers need special handling so ``Bearer`` is not mistaken for the value.
+    (re.compile(r'(?i)(\bauthorization\b\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+'),
+     r'\1[redacted]'),
+    # Environment-style, JSON-style, and ordinary diagnostic key/value output.
+    (re.compile(
+        r'(?i)(["\']?(?:[a-z][a-z0-9_]*(?:token|secret|api_key|password|private_key)'
+        r'|api[_ -]?key|client[_ -]?secret|token)["\']?\s*[:=]\s*)'
+        r'["\']?[^\s,"\';]+["\']?'), r'\1[redacted]'),
+    # Common credential shapes are removed even when a label was omitted.
+    (re.compile(r'AIza[0-9A-Za-z_-]{30,}'), '[redacted-api-key]'),
+    (re.compile(
+        r'(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,30}\.[A-Za-z0-9_-]{5,10}'
+        r'\.[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])'), '[redacted-token]'),
+    (re.compile(r'(?i)(discord(?:app)?\.com/api/webhooks/\d+/)[^/\s]+'),
+     r'\1[redacted]'),
+)
+
+
+def redact_console_text(value):
+    """Remove common credential forms before diagnostic output reaches Tk."""
+    result = str(value or '')
+    for pattern, replacement in _CONSOLE_SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def read_console_update(path, offset=None, max_bytes=CONSOLE_READ_BYTES):
+    """Read a bounded incremental log tail and return text, offset, and reset state."""
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return '', 0, offset not in (None, 0)
+
+    limit = max(1, int(max_bytes))
+    reset = offset is None or offset < 0 or offset > size
+    if reset:
+        start = max(0, size - limit)
+    elif size - offset > limit:
+        start = max(0, size - limit)
+        reset = True
+    else:
+        start = offset
+
+    try:
+        with path.open('rb') as stream:
+            stream.seek(start)
+            # A bounded tail can begin halfway through a UTF-8 line. Drop only
+            # that partial line; incremental reads always start at a known offset.
+            if start and reset:
+                stream.readline()
+            payload = stream.read(limit)
+            new_offset = stream.tell()
+    except OSError:
+        return '', int(offset or 0), False
+    return redact_console_text(payload.decode('utf-8', 'replace')), new_offset, reset
+
+
+def warcraft_import_progress_lines(content):
+    """Keep only marked backend import progress from a shared process log."""
+    return ''.join(
+        line for line in str(content).splitlines(keepends=True)
+        if WARCRAFT_IMPORT_LOG_MARKER in line
+    )
+
+
+def parse_warcraft_import_progress(content):
+    """Decode structured import snapshots from the backend process log."""
+    updates = []
+    for line in str(content).splitlines():
+        if WARCRAFT_IMPORT_LOG_MARKER not in line:
+            continue
+        payload = line.partition(WARCRAFT_IMPORT_LOG_MARKER)[2]
+        try:
+            update = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(update, dict) and isinstance(update.get('report_id'), str)
+                and isinstance(update.get('progress'), dict)):
+            logged_at = line.partition(WARCRAFT_IMPORT_LOG_MARKER)[0].strip()
+            if logged_at:
+                update['_logged_at'] = logged_at
+            updates.append(update)
+    return updates
+
+
+IMPORT_ACTIVITY_STALE_SECONDS = 300
+
+
+def import_update_is_active(update, now=None):
+    """Treat abandoned running snapshots from an old process as inactive."""
+    if str(update.get('status') or '').casefold() not in {'queued', 'running'}:
+        return False
+    logged_at = update.get('_logged_at')
+    if not logged_at:
+        return True
+    try:
+        timestamp = datetime.fromisoformat(str(logged_at).replace('Z', '+00:00'))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        return (current - timestamp.astimezone(timezone.utc)).total_seconds() <= \
+            IMPORT_ACTIVITY_STALE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def saved_guild_ids(settings_path=None):
+    """Return valid configured guild IDs without exposing any other saved state."""
+    path = Path(settings_path or Path(__file__).resolve().parent.parent /
+                '.carter_data' / 'guild-settings.json')
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    guilds = payload.get('guilds') if isinstance(payload, dict) else None
+    if not isinstance(guilds, dict):
+        return []
+    return sorted(
+        str(value) for value in guilds
+        if str(value).isdecimal() and 1 <= len(str(value)) <= 20 and int(value) > 0
+    )
+
+
+def guild_data_directory(storage, guild_id):
+    """Resolve the GUI's token target to the same per-guild layout as the API."""
+    value = str(guild_id or '').strip()
+    if not value.isdecimal() or not 1 <= len(value) <= 20 or int(value) <= 0:
+        raise ValueError('A positive Discord guild ID is required.')
+    root = Path(storage).resolve()
+    destination = (root / 'guilds' / value).resolve()
+    if destination.parent != (root / 'guilds').resolve():
+        raise ValueError('The Discord guild ID is invalid.')
+    return destination
 
 
 def validate_learner_selection(path, encounters):
@@ -363,8 +506,9 @@ class TimelineWindow:
         if not client_id or not client_secret:
             messagebox.showerror(
                 'Credentials required',
-                'Add WARCRAFT_LOGS_CLIENT_ID and WARCRAFT_LOGS_CLIENT_SECRET to the '
-                'project .env file, then try again.', parent=self.root)
+                'Add CARTER_WARCRAFT_LOGS_CLIENT_ID and '
+                'CARTER_WARCRAFT_LOGS_CLIENT_SECRET to the repository-root .env file, '
+                'then try again.', parent=self.root)
             return
         filename = path.name
         prefix, suffix = 'warcraft-logs-', '.wcl.json'
@@ -840,7 +984,7 @@ class EncounterMapWindow:
     def current_map(self):
         try:
             return int(self.map_id.get())
-        except ValueError:
+        except (OSError, ValueError):
             return None
 
     def map_changed(self, _event=None):
@@ -2011,8 +2155,8 @@ class Launcher:
     def __init__(self, root, initial=None):
         self.root = root
         root.title('WoW Combat Log Tools')
-        root.geometry('1020x640')
-        root.minsize(900, 590)
+        root.geometry('1120x860')
+        root.minsize(950, 720)
         chosen = initial or default_log()
         self.path = tk.StringVar(value=str(chosen or ''))
         self.carter = CarterProcessController()
@@ -2022,6 +2166,22 @@ class Launcher:
         self.carter_status = tk.StringVar(value='Carter status: checking...')
         self.live_token_status = tk.StringVar(value='Live token: checking...')
         self.live_storage = Path(__file__).resolve().parent / 'data'
+        guilds = saved_guild_ids()
+        self.live_guild_id = tk.StringVar(value=guilds[0] if len(guilds) == 1 else '')
+        self.console_status = tk.StringVar(value='Console tail starting...')
+        self.console_paths = {
+            'carter': self.carter.log_path,
+            'backend': self.carter.runtime_directory / 'analysis-backend.log',
+            'warcraft_logs': self.carter.runtime_directory / 'analysis-backend.log',
+        }
+        self.console_offsets = {name: None for name in self.console_paths}
+        self.console_views = {}
+        self.console_tab_names = []
+        self.backend_import_jobs = {}
+        self.local_import_active = False
+        self.backend_import_active = False
+        self.import_console_active = False
+        self.console_import_status = tk.StringVar(value='No active Warcraft Logs import.')
 
         body = ttk.Frame(root, padding=22)
         body.pack(fill='both', expand=True)
@@ -2039,7 +2199,7 @@ class Launcher:
         ttk.Label(services, textvariable=self.carter_status).grid(
             row=0, column=0, sticky='w')
         controls = ttk.Frame(services)
-        controls.grid(row=0, column=1, rowspan=2, sticky='e', padx=(12, 0))
+        controls.grid(row=0, column=1, rowspan=4, sticky='e', padx=(12, 0))
         self.carter_start_button = ttk.Button(
             controls, text='Start Carter', command=lambda: self.run_carter_action('start'))
         self.carter_start_button.pack(side='left')
@@ -2049,18 +2209,23 @@ class Launcher:
         self.carter_restart_button = ttk.Button(
             controls, text='Restart', command=lambda: self.run_carter_action('restart'))
         self.carter_restart_button.pack(side='left', padx=(6, 0))
+        guild_row = ttk.Frame(services)
+        guild_row.grid(row=1, column=0, sticky='w', pady=(6, 0))
+        ttk.Label(guild_row, text='Live token guild ID:').pack(side='left')
+        ttk.Entry(guild_row, textvariable=self.live_guild_id, width=24).pack(
+            side='left', padx=(6, 0))
         ttk.Label(services, textvariable=self.live_token_status).grid(
-            row=1, column=0, sticky='w', pady=(6, 0))
+            row=2, column=0, sticky='w', pady=(6, 0))
         self.live_token_button = ttk.Button(
             services, text='Generate / verify live token', command=self.prepare_live_token)
-        self.live_token_button.grid(row=2, column=0, sticky='w', pady=(8, 0))
+        self.live_token_button.grid(row=3, column=0, sticky='w', pady=(8, 0))
         ttk.Label(
             services,
             text='The token value stays private on disk; only its fingerprint is displayed.',
-        ).grid(row=2, column=1, sticky='e', padx=(12, 0), pady=(8, 0))
+        ).grid(row=3, column=1, sticky='e', padx=(12, 0), pady=(8, 0))
 
-        actions = ttk.Frame(body, padding=(0, 24, 0, 0))
-        actions.pack(fill='both', expand=True)
+        actions = ttk.Frame(body, padding=(0, 18, 0, 0))
+        actions.pack(fill='x')
         for column in range(3):
             actions.columnconfigure(column, weight=1, uniform='launcher-actions')
         actions.rowconfigure(0, weight=1)
@@ -2079,8 +2244,269 @@ class Launcher:
         fight_modules.grid(row=1, column=1, sticky='nsew', padx=6, pady=(6, 0))
         ttk.Label(body, text='View damage, healing, DPS/HPS, rank, and position, or export timeline CSV files.')\
             .pack(anchor='w', pady=(14, 0))
+
+        console = ttk.LabelFrame(body, text='Live diagnostics console', padding=8)
+        console.pack(fill='both', expand=True, pady=(14, 0))
+        ttk.Label(
+            console, textvariable=self.console_import_status, anchor='w',
+            wraplength=1000,
+        ).pack(fill='x', pady=(0, 4))
+        console_toolbar = ttk.Frame(console)
+        console_toolbar.pack(fill='x', pady=(0, 6))
+        ttk.Label(console_toolbar, textvariable=self.console_status).pack(
+            side='left', fill='x', expand=True)
+        self.console_progress = ttk.Progressbar(
+            console_toolbar, mode='determinate', maximum=100, value=0, length=110)
+        self.console_progress.pack(side='left')
+        ttk.Button(console_toolbar, text='Copy selected',
+                   command=lambda: self.copy_console(True)).pack(side='left', padx=(6, 0))
+        ttk.Button(console_toolbar, text='Copy all',
+                   command=lambda: self.copy_console(False)).pack(side='left', padx=(6, 0))
+        ttk.Button(console_toolbar, text='Clear view', command=self.clear_console).pack(
+            side='left', padx=(6, 0))
+        ttk.Button(console_toolbar, text='Reload recent', command=self.reload_console).pack(
+            side='left', padx=(6, 0))
+
+        self.console_notebook = ttk.Notebook(console)
+        self.console_notebook.pack(fill='both', expand=True)
+        for name, title in (('carter', 'Carter'), ('backend', 'Analysis backend'),
+                            ('warcraft_logs', 'Warcraft Logs')):
+            tab = ttk.Frame(self.console_notebook)
+            tab.rowconfigure(0, weight=1)
+            tab.columnconfigure(0, weight=1)
+            view = tk.Text(tab, wrap='none', state='disabled', font='TkFixedFont',
+                           undo=False, exportselection=True)
+            vertical = ttk.Scrollbar(tab, orient='vertical', command=view.yview)
+            horizontal = ttk.Scrollbar(tab, orient='horizontal', command=view.xview)
+            view.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+            view.grid(row=0, column=0, sticky='nsew')
+            vertical.grid(row=0, column=1, sticky='ns')
+            horizontal.grid(row=1, column=0, sticky='ew')
+            self.console_notebook.add(tab, text=title)
+            self.console_tab_names.append(name)
+            self.console_views[name] = view
+        self.console_notebook.bind('<<NotebookTabChanged>>', self.refresh_console_status)
         self.refresh_live_token_status()
         self.poll_services()
+
+    def active_console_name(self):
+        try:
+            return self.console_tab_names[self.console_notebook.index('current')]
+        except (IndexError, tk.TclError):
+            return 'carter'
+
+    def refresh_console_status(self, _event=None):
+        name = self.active_console_name()
+        labels = {
+            'carter': 'Carter',
+            'backend': 'Analysis backend',
+            'warcraft_logs': 'Warcraft Logs',
+        }
+        label = labels[name]
+        if name == 'warcraft_logs':
+            detail = ('download active; live progress and diagnostics shown here'
+                      if self.import_console_active else
+                      'live backend import progress feed'
+                      if self.console_paths[name].is_file() else
+                      'waiting for backend import progress')
+        elif self.console_paths[name].is_file():
+            detail = 'live tail active'
+        elif name == 'carter':
+            detail = 'waiting for the first GUI-launched Carter output'
+        else:
+            detail = 'waiting for backend output'
+        self.console_status.set(f'{label}: {detail}; common credentials are redacted.')
+
+    def _replace_or_append_console(self, name, content, reset=False):
+        view = self.console_views[name]
+        at_bottom = view.yview()[1] >= 0.98
+        view.configure(state='normal')
+        if reset:
+            view.delete('1.0', 'end')
+        if content:
+            view.insert('end', content)
+            character_count = int(view.count('1.0', 'end-1c', 'chars')[0])
+            if character_count > CONSOLE_MAX_CHARS:
+                view.delete('1.0', f'1.0 + {character_count - CONSOLE_MAX_CHARS} chars')
+            if at_bottom:
+                view.see('end')
+        view.configure(state='disabled')
+
+    def poll_console_logs(self):
+        for name, path in self.console_paths.items():
+            if path is None:
+                continue
+            content, offset, reset = read_console_update(
+                path, self.console_offsets[name])
+            self.console_offsets[name] = offset
+            if name == 'warcraft_logs':
+                content = warcraft_import_progress_lines(content)
+                self._update_backend_import_activity(content)
+            if content or reset:
+                keep_local_activity = name == 'warcraft_logs' and self.local_import_active
+                self._replace_or_append_console(
+                    name, content, reset and not keep_local_activity)
+        self.refresh_console_status()
+
+    def append_import_console(self, message):
+        text = redact_console_text(message).rstrip('\n') + '\n'
+        self._replace_or_append_console('warcraft_logs', text)
+        if self.local_import_active:
+            self.console_import_status.set(text.strip())
+
+    def set_import_console_active(self, active):
+        self.local_import_active = bool(active)
+        if self.local_import_active:
+            self.console_progress.stop()
+            self.console_progress.configure(mode='indeterminate')
+            self.console_progress.start(10)
+            self.import_console_active = True
+        else:
+            self._refresh_backend_import_activity()
+
+    def _update_backend_import_activity(self, content):
+        for update in parse_warcraft_import_progress(content):
+            report_id = update['report_id']
+            self.backend_import_jobs[report_id] = update
+            if len(self.backend_import_jobs) > 50:
+                self.backend_import_jobs.pop(next(iter(self.backend_import_jobs)))
+        self._refresh_backend_import_activity()
+
+    def _refresh_backend_import_activity(self):
+        active_jobs = [
+            update for update in self.backend_import_jobs.values()
+            if import_update_is_active(update)
+        ]
+        running_jobs = [update for update in active_jobs if update.get('status') == 'running']
+        latest = (running_jobs or active_jobs or list(self.backend_import_jobs.values()))
+        update = latest[-1] if latest else None
+        self.backend_import_active = bool(active_jobs)
+        self.import_console_active = self.local_import_active or self.backend_import_active
+        if self.local_import_active:
+            return
+        if update is None:
+            self.console_progress.stop()
+            self.console_progress.configure(mode='determinate', value=0)
+            self.console_import_status.set('No active Warcraft Logs import.')
+            return
+        self._show_backend_import_progress(update)
+
+    def _show_backend_import_progress(self, update):
+        report_id = update['report_id']
+        status = str(update.get('status') or 'unknown')
+        stage = str(update.get('stage') or status)
+        progress = update.get('progress') or {}
+        percent = progress.get('percent')
+        completed = progress.get('completed_fights', 0)
+        total = progress.get('total_fights')
+        message = str(progress.get('message') or '')
+        errors = update.get('errors')
+        error = errors[-1] if isinstance(errors, list) and errors else {}
+        failure = str(error.get('message') or message) if isinstance(error, dict) else message
+
+        if status == 'queued':
+            self.console_progress.stop()
+            self.console_progress.configure(mode='determinate', value=0)
+            detail = 'Waiting for processing'
+        elif status == 'running' and stage == 'analysis' and isinstance(total, int) and total > 0:
+            display_percent = max(0, min(99, int(percent or 0)))
+            self.console_progress.stop()
+            self.console_progress.configure(
+                mode='determinate', maximum=100,
+                value=display_percent,
+            )
+            detail = f'{display_percent}% · {completed}/{total} encounters'
+        elif status == 'running':
+            self.console_progress.stop()
+            self.console_progress.configure(mode='indeterminate')
+            self.console_progress.start(10)
+            stage_names = {
+                'configuration': 'Preparing import',
+                'download': 'Downloading',
+                'cache': 'Checking cache',
+                'queued': 'Waiting for processing',
+            }
+            detail = stage_names.get(stage, stage.replace('_', ' ').capitalize())
+        elif status in {'succeeded', 'partial'}:
+            self.console_progress.stop()
+            self.console_progress.configure(
+                mode='determinate', maximum=100,
+                value=int(percent if isinstance(percent, int) else 100),
+            )
+            detail = 'Completed successfully' if status == 'succeeded' else 'Completed with errors'
+        elif status == 'rate_limited':
+            self.console_progress.stop()
+            self.console_progress.configure(
+                mode='determinate', value=int(percent or 0))
+            retry_after = error.get('retry_after_seconds') if isinstance(error, dict) else None
+            detail = 'Rate limited'
+            if retry_after is not None:
+                detail += f'; retry after {retry_after}s'
+        elif status == 'failed':
+            self.console_progress.stop()
+            self.console_progress.configure(
+                mode='determinate', value=int(percent or 0))
+            detail = f'Failed: {failure}'
+        else:
+            self.console_progress.stop()
+            self.console_progress.configure(mode='determinate', value=int(percent or 0))
+            detail = status.replace('_', ' ').capitalize()
+
+        status_text = f'{report_id} · {stage} · {status} · {detail}'
+        if status in {'partial', 'failed', 'rate_limited'} and failure:
+            status_text += f' · {failure}'
+        elif message and status not in {'succeeded'}:
+            status_text += f' · {message}'
+        self.console_import_status.set(status_text)
+
+    def copy_console(self, selected_only):
+        view = self.console_views[self.active_console_name()]
+        try:
+            if selected_only:
+                content = view.get('sel.first', 'sel.last')
+            else:
+                content = view.get('1.0', 'end-1c')
+        except tk.TclError:
+            self.console_status.set('No console text is selected.')
+            return
+        if not content:
+            self.console_status.set('The current console is empty.')
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.root.update_idletasks()
+        self.console_status.set(
+            f'Copied {len(content):,} redacted console characters to the clipboard.')
+
+    def clear_console(self):
+        name = self.active_console_name()
+        path = self.console_paths[name]
+        if path is not None:
+            try:
+                self.console_offsets[name] = path.stat().st_size
+            except OSError:
+                self.console_offsets[name] = 0
+        self._replace_or_append_console(name, '', True)
+        detail = ('Cleared this in-memory import view.'
+                  if path is None else
+                  'Cleared this view; the private log file was not deleted.')
+        self.console_status.set(detail)
+
+    def reload_console(self):
+        name = self.active_console_name()
+        path = self.console_paths[name]
+        if path is None:
+            self.console_status.set('Import diagnostics are shown as they arrive; no file to reload.')
+            return
+        self.console_offsets[name] = None
+        content, offset, _reset = read_console_update(path, None)
+        self.console_offsets[name] = offset
+        if name == 'warcraft_logs':
+            content = warcraft_import_progress_lines(content)
+            self._update_backend_import_activity(content)
+        self._replace_or_append_console(name, content, True)
+        self.console_status.set(
+            'Reloaded the bounded recent tail; common credentials are redacted.')
 
     def refresh_carter_status(self):
         state = self.carter.status()
@@ -2125,9 +2551,10 @@ class Launcher:
 
     def refresh_live_token_status(self):
         try:
-            info = live_access_token_info(self.live_storage)
+            storage = guild_data_directory(self.live_storage, self.live_guild_id.get())
+            info = live_access_token_info(storage)
         except ValueError:
-            self.live_token_status.set('Live token: invalid or inaccessible')
+            self.live_token_status.set('Live token: enter one Discord guild ID')
             return
         if info is None:
             self.live_token_status.set('Live token: not generated')
@@ -2137,7 +2564,8 @@ class Launcher:
 
     def prepare_live_token(self):
         try:
-            info = ensure_live_access_token(self.live_storage)
+            storage = guild_data_directory(self.live_storage, self.live_guild_id.get())
+            info = ensure_live_access_token(storage)
         except (OSError, ValueError):
             self.live_token_status.set('Live token: generation failed')
             return
@@ -2157,6 +2585,7 @@ class Launcher:
         except queue.Empty:
             pass
         self.refresh_carter_status()
+        self.poll_console_logs()
         if self.root.winfo_exists():
             self.root.after(1000, self.poll_services)
 
@@ -2192,7 +2621,11 @@ class Launcher:
             TimelineWindow(tk.Toplevel(self.root), str(path))
 
     def open_importer(self):
-        WarcraftLogsImportWindow(self.root, self.import_finished)
+        WarcraftLogsImportWindow(
+            self.root, self.import_finished,
+            on_progress=self.append_import_console,
+            on_activity=self.set_import_console_active,
+        )
 
     def open_cross_report_learner(self):
         paths = sorted(
@@ -2220,13 +2653,15 @@ class Launcher:
 class WarcraftLogsImportWindow:
     """Collect API credentials and download a report without blocking Tk."""
 
-    def __init__(self, parent, on_complete):
+    def __init__(self, parent, on_complete, on_progress=None, on_activity=None):
         self.root = tk.Toplevel(parent)
         self.root.title('Import Warcraft Logs Reports')
         self.root.geometry('700x560')
         self.root.minsize(650, 460)
         self.root.resizable(True, True)
         self.on_complete = on_complete
+        self.on_progress = on_progress
+        self.on_activity = on_activity
         self.messages = queue.SimpleQueue()
         self.busy = False
         client_id, client_secret = load_credentials()
@@ -2264,8 +2699,9 @@ class WarcraftLogsImportWindow:
         self.client_secret_entry.grid(row=2, column=1, sticky='ew', padx=(10, 0), pady=5)
         ttk.Label(
             body, wraplength=660, justify='left',
-            text='Set WARCRAFT_LOGS_CLIENT_ID and WARCRAFT_LOGS_CLIENT_SECRET in .env, or '
-                 'enter them above. Create a client at https://www.warcraftlogs.com/api/clients/ . '
+            text='Set CARTER_WARCRAFT_LOGS_CLIENT_ID and '
+                 'CARTER_WARCRAFT_LOGS_CLIENT_SECRET in the repository-root .env, or enter '
+                 'them above. Create a client at https://www.warcraftlogs.com/api/clients/ . '
                  'Client-credentials access works with public and unlisted reports; private reports '
                  'require user authorization and cannot be imported by this dialog.',
             padding=(0, 12, 0, 10)).pack(anchor='w')
@@ -2336,6 +2772,8 @@ class WarcraftLogsImportWindow:
         self.button.configure(state='disabled')
         self.set_input_state(False)
         self.progress.start(10)
+        if self.on_activity is not None:
+            self.on_activity(True)
         report_values = [value for value, _code in reports]
 
         def work():
@@ -2355,9 +2793,13 @@ class WarcraftLogsImportWindow:
                 message = self.messages.get_nowait()
                 if message[0] == 'progress':
                     self.status.set(message[1])
+                    if self.on_progress is not None:
+                        self.on_progress(message[1])
                 elif message[0] == 'done':
                     completed, failures = message[1], message[2]
                     self.progress.stop()
+                    if self.on_activity is not None:
+                        self.on_activity(False)
                     if not completed:
                         self.busy = False
                         self.button.configure(state='normal')
@@ -2393,6 +2835,8 @@ class WarcraftLogsImportWindow:
                 elif message[0] == 'error':
                     self.busy = False
                     self.progress.stop()
+                    if self.on_activity is not None:
+                        self.on_activity(False)
                     self.button.configure(state='normal')
                     self.set_input_state(True)
                     self.status.set('Import failed.')

@@ -1,7 +1,12 @@
 import json
+import gzip
+import io
 import os
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -10,13 +15,17 @@ if __package__:
     from .warcraft_logs_importer import (WarcraftLogsClient, download_report_batch,
                                          extract_report_code, load_cache, load_credentials,
                                          analysis_directory, prepare_report_batch,
-                                         prune_report_caches, metadata_path)
+                                         prune_report_caches, metadata_path,
+                                         download_checkpoint_path,
+                                         WarcraftLogsRateLimitError)
 else:
     from encounter_parser import analyze_encounter, scan_encounters
     from warcraft_logs_importer import (WarcraftLogsClient, download_report_batch,
                                         extract_report_code, load_cache, load_credentials,
                                         analysis_directory, prepare_report_batch,
-                                        prune_report_caches, metadata_path)
+                                        prune_report_caches, metadata_path,
+                                        download_checkpoint_path,
+                                        WarcraftLogsRateLimitError)
 
 
 def sample_report():
@@ -82,12 +91,60 @@ class WarcraftLogsImporterTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(load_credentials(env_file), ('sample-id', 'sample-secret'))
 
+    def test_default_credentials_use_carter_prefixed_values_from_root_env(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            env_file = Path(folder) / '.env'
+            env_file.write_text(
+                'CARTER_WARCRAFT_LOGS_CLIENT_ID=root-id\n'
+                'CARTER_WARCRAFT_LOGS_CLIENT_SECRET="root-secret"\n', encoding='utf-8')
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+                    load_credentials.__globals__, {'PROJECT_ENV_FILE': env_file}):
+                self.assertEqual(load_credentials(), ('root-id', 'root-secret'))
+
+    def test_process_credentials_override_root_env_without_logging_values(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            env_file = Path(folder) / '.env'
+            env_file.write_text(
+                'CARTER_WARCRAFT_LOGS_CLIENT_ID=file-id\n'
+                'CARTER_WARCRAFT_LOGS_CLIENT_SECRET=file-secret\n', encoding='utf-8')
+            with mock.patch.dict(os.environ, {
+                    'WARCRAFT_LOGS_CLIENT_ID': 'process-id',
+                    'WARCRAFT_LOGS_CLIENT_SECRET': 'process-secret',
+            }, clear=True):
+                self.assertEqual(
+                    load_credentials(env_file), ('process-id', 'process-secret'))
+
     def test_extract_report_code(self):
         self.assertEqual(extract_report_code(
             'https://www.warcraftlogs.com/reports/AbCd1234#fight=7'), 'AbCd1234')
         self.assertEqual(extract_report_code('AbCd1234'), 'AbCd1234')
         with self.assertRaises(ValueError):
             extract_report_code('not a report')
+
+    def test_http_429_is_a_safe_rate_limit_signal(self):
+        error = urllib.error.HTTPError(
+            'https://example.invalid', 429, 'private upstream message',
+            {'Retry-After': '17'}, io.BytesIO(b'{"private":"body"}'),
+        )
+        request = urllib.request.Request('https://example.invalid')
+        with mock.patch('urllib.request.urlopen', side_effect=error):
+            with self.assertRaises(WarcraftLogsRateLimitError) as raised:
+                WarcraftLogsClient('id', 'secret')._open_json(request)
+        self.assertEqual(raised.exception.retry_after_seconds, 17)
+        self.assertNotIn('private', str(raised.exception))
+
+    def test_http_json_requests_and_decodes_gzip(self):
+        payload = gzip.compress(json.dumps({'ready': True}).encode('utf-8'))
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {'Content-Encoding': 'gzip'}
+        response.read.return_value = payload
+        request = urllib.request.Request('https://example.invalid')
+        with mock.patch('urllib.request.urlopen', return_value=response):
+            self.assertEqual(
+                WarcraftLogsClient('id', 'secret')._open_json(request),
+                {'ready': True},
+            )
 
     def test_prepare_report_batch_limits_and_rejects_duplicates(self):
         prepared = prepare_report_batch([
@@ -123,6 +180,31 @@ class WarcraftLogsImporterTests(unittest.TestCase):
                                          'error': 'private report'}])
             self.assertTrue(any('Report 3/3' in message for message in messages))
 
+    def test_batch_reuses_valid_cache_and_stops_after_rate_limit(self):
+        calls = []
+
+        class BatchClient:
+            def download_report(self, report_value, destination, progress):
+                calls.append(extract_report_code(report_value))
+                raise WarcraftLogsRateLimitError(20)
+
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            root = Path(folder)
+            cached = root / 'warcraft-logs-Cached001.wcl.json'
+            _report = sample_report()
+            cached.write_text(json.dumps({
+                'format': 'wow-log-tools-warcraft-logs-v1',
+                'report': _report,
+                'eventsByFight': {'7': EVENTS},
+            }), encoding='utf-8')
+            completed, failures = download_report_batch(
+                BatchClient(), ['Cached001', 'Limited01', 'NeverRun2'], root,
+            )
+            self.assertEqual(completed, [cached])
+            self.assertEqual(calls, ['Limited01'])
+            self.assertEqual(failures[0]['report_code'], 'Limited01')
+            self.assertTrue(failures[0]['retryable'])
+
     def test_download_paginates_and_writes_cache(self):
         with tempfile.TemporaryDirectory(dir='.') as folder:
             destination = Path(folder) / 'report.wcl.json'
@@ -132,6 +214,70 @@ class WarcraftLogsImporterTests(unittest.TestCase):
             self.assertEqual(len(cache['eventsByFight']['7']), len(EVENTS))
             self.assertTrue(metadata_path(destination).is_file())
             self.assertTrue(any('Imported 5 events' in message for message in messages))
+
+    def test_download_debug_prints_page_cursor_and_counts_to_stderr(self):
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            destination = Path(folder) / 'report.wcl.json'
+            output = io.StringIO()
+            progress = []
+            with mock.patch.dict(os.environ, {'WARCRAFT_LOGS_DOWNLOAD_DEBUG': '1'}):
+                with redirect_stderr(output):
+                    FakeClient('id', 'secret').download_report(
+                        'AbCd1234', destination, progress.append)
+
+            messages = output.getvalue()
+            self.assertIn('page=1 start=1000 end=5000 events_before=0 request_started', messages)
+            self.assertIn('returned_events=2 collected_events=2 next_start=1701', messages)
+            self.assertIn('page=2 start=1701 end=5000 events_before=2 request_started', messages)
+            self.assertIn('returned_events=3 collected_events=5 next_start=None', messages)
+            self.assertNotIn('secret', messages)
+            self.assertTrue(any(
+                '[debug] report=AbCd1234 fight=7 pull=1/1 page=1' in item
+                for item in progress))
+
+    def test_rate_limited_download_resumes_from_atomic_page_checkpoint(self):
+        class LimitedClient(FakeClient):
+            def graphql(self, query, variables):
+                if 'query Report' in query:
+                    return super().graphql(query, variables)
+                if variables['start'] == 1000:
+                    return {'reportData': {'report': {'events': {
+                        'data': EVENTS[:2], 'nextPageTimestamp': 1701,
+                    }}}}
+                raise WarcraftLogsRateLimitError(30)
+
+        class ResumeClient(FakeClient):
+            starts = []
+
+            def graphql(self, query, variables):
+                if 'query Report' in query:
+                    raise AssertionError('resume should use checkpoint metadata')
+                self.starts.append(variables['start'])
+                return {'reportData': {'report': {'events': {
+                    'data': EVENTS[2:], 'nextPageTimestamp': None,
+                }}}}
+
+        with tempfile.TemporaryDirectory(dir='.') as folder:
+            destination = Path(folder) / 'report.wcl.json'
+            destination.write_text('previous complete cache remains intact', encoding='utf-8')
+            previous = destination.read_bytes()
+            with self.assertRaises(WarcraftLogsRateLimitError):
+                LimitedClient('id', 'secret').download_report('AbCd1234', destination)
+            checkpoint = download_checkpoint_path(destination)
+            self.assertTrue(checkpoint.is_file())
+            self.assertEqual(destination.read_bytes(), previous)
+            if os.name == 'posix':
+                self.assertEqual(checkpoint.stat().st_mode & 0o077, 0)
+            saved = json.loads(checkpoint.read_text(encoding='utf-8'))
+            self.assertEqual(saved['current']['next_start'], 1701.0)
+            self.assertEqual(len(saved['current']['events']), 2)
+
+            resumed = ResumeClient('id', 'secret')
+            resumed.download_report('AbCd1234', destination)
+
+            self.assertEqual(resumed.starts, [1701.0])
+            self.assertEqual(len(load_cache(destination)['eventsByFight']['7']), len(EVENTS))
+            self.assertFalse(checkpoint.exists())
 
     def test_imported_report_uses_existing_analysis_model(self):
         with tempfile.TemporaryDirectory(dir='.') as folder:
@@ -166,19 +312,22 @@ class WarcraftLogsImporterTests(unittest.TestCase):
                 restored = analyze_encounter(destination, encounters[0])
             self.assertEqual(restored.players[0].damage, 100)
 
-    def test_report_retention_keeps_newest_five_and_removes_analysis(self):
+    def test_report_retention_uses_raid_time_and_removes_analysis(self):
         with tempfile.TemporaryDirectory(dir='.') as folder:
             root = Path(folder)
             caches = []
             for index in range(6):
                 cache = root / f'warcraft-logs-Report{index:02d}.wcl.json'
                 cache.write_text('{}', encoding='utf-8')
-                timestamp = 1_700_000_000 + index
+                # File download order deliberately opposes report chronology.
+                timestamp = 1_700_000_000 + (5 - index)
                 os.utime(cache, (timestamp, timestamp))
                 sidecar = analysis_directory(cache)
                 sidecar.mkdir()
                 (sidecar / 'fight-1.json.gz').write_text('saved', encoding='utf-8')
-                metadata_path(cache).write_text('{}', encoding='utf-8')
+                metadata_path(cache).write_text(json.dumps({
+                    'report': {'startTime': index * 1000, 'endTime': index * 1000 + 500},
+                }), encoding='utf-8')
                 caches.append(cache)
             removed = prune_report_caches(root)
             self.assertEqual(removed, [caches[0].resolve()])

@@ -52,7 +52,7 @@ class WakeWordDetector:
         self._recognizer_factory = recognizer_factory
 
     def process(self, user_id, pcm) -> bool:
-        """Return True once a whole wake name appears in partial/final text."""
+        """Return True only when partial/final text begins with the wake phrase."""
         with self._lock:
             if self._closed or not pcm:
                 return False
@@ -83,10 +83,7 @@ class WakeWordDetector:
             text = data.get("text" if final else "partial", "")
             tokens = tuple(re.findall(r"[a-z]+", str(text).casefold()))
             size = len(self.phrase)
-            hit = speaker[2] and any(
-                tokens[index:index + size] == self.phrase
-                for index in range(len(tokens) - size + 1)
-            )
+            hit = speaker[2] and tokens[:size] == self.phrase
             if hit or final or speaker[3] >= self.SAMPLE_RATE * self.MAX_UTTERANCE_SECONDS:
                 recognizer.Reset()
                 speaker[1:] = [self._converter(), False, 0]

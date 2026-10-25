@@ -32,6 +32,7 @@ MAX_UPDATE_HISTORY = 5000
 MAX_COMPLETED_ENCOUNTERS = 20
 LIVE_ACCESS_TOKEN_FILENAME = '.live-access-token'
 LIVE_ACCESS_TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9_-]{40,128}$')
+REMOTE_INGEST_STATE_FILENAME = 'remote-ingest-state.json'
 
 
 def live_access_token_info(storage: Path, *, create=False):
@@ -83,8 +84,9 @@ class LiveLogService:
 
     def __init__(self, source: Path | None, storage: Path, *, from_end=True,
                  poll_interval=0.2, rebuild_interval=0.5, mechanic_registry=None,
-                 timeline_clock=None):
+                 timeline_clock=None, remote=False):
         self.source = Path(source).resolve() if source else None
+        self.remote = bool(remote)
         self.storage = Path(storage).resolve() / 'live-analysis'
         token = ensure_live_access_token(storage)
         self.access_token_path = token['path']
@@ -92,9 +94,11 @@ class LiveLogService:
         self.from_end = bool(from_end)
         self.poll_interval = max(0.05, float(poll_interval))
         self.rebuild_interval = max(0.05, float(rebuild_interval))
-        source_key = str(self.source).casefold() if self.source else 'unconfigured'
+        source_key = str(self.source).casefold() if self.source else (
+            f'remote:{Path(storage).resolve()}' if self.remote else 'unconfigured')
         self.session_id = hashlib.sha256(source_key.encode()).hexdigest()[:16]
-        self.source_name = self.source.name if self.source else None
+        self.source_name = self.source.name if self.source else (
+            'remote WoWCombatLog.txt' if self.remote else None)
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
@@ -103,8 +107,8 @@ class LiveLogService:
         self._initialized = False
         self._cursor = 0
         self._updates = deque(maxlen=MAX_UPDATE_HISTORY)
-        self._state = 'idle' if source else 'error'
-        self._error_code = None if source else 'LIVE_SOURCE_NOT_CONFIGURED'
+        self._state = 'idle' if source or self.remote else 'error'
+        self._error_code = None if source or self.remote else 'LIVE_SOURCE_NOT_CONFIGURED'
         self._parse_errors = 0
         self._last_event_at = None
         self._last_event_epoch = None
@@ -120,11 +124,71 @@ class LiveLogService:
             mechanic_registry or MechanicScriptRegistry(), timeline_clock)
         self._restored_schedule = None
         self._last_start_signature = None
+        self._remote_streams = self._load_remote_ingest_state() if self.remote else {}
         self._load_completed()
+        if self.remote:
+            self._recover_remote_spool()
 
     @property
     def configured(self):
-        return self.source is not None
+        return self.source is not None or self.remote
+
+    def _remote_ingest_state_path(self):
+        return self.storage / REMOTE_INGEST_STATE_FILENAME
+
+    def _load_remote_ingest_state(self):
+        try:
+            payload = json.loads(self._remote_ingest_state_path().read_text(encoding='utf-8'))
+            streams = payload.get('streams', {})
+            if isinstance(streams, dict):
+                return {str(key): int(value) for key, value in streams.items()
+                        if isinstance(value, int) and value >= 0}
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
+    def _save_remote_ingest_state(self):
+        self.storage.mkdir(parents=True, exist_ok=True)
+        destination = self._remote_ingest_state_path()
+        temporary = destination.with_suffix('.json.part')
+        temporary.write_text(json.dumps({'version': 1, 'streams': self._remote_streams},
+                                        separators=(',', ':')), encoding='utf-8')
+        temporary.replace(destination)
+
+    def ingest_remote_batch(self, stream_id, offset, payload):
+        """Ingest one complete-line byte batch and durably acknowledge its file offset."""
+        if not self.remote:
+            raise ValueError('Remote ingestion is not configured.')
+        stream_id = str(stream_id or '')
+        if not re.fullmatch(r'[A-Za-z0-9._-]{8,128}', stream_id):
+            raise ValueError('The stream identifier is invalid.')
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError) as error:
+            raise ValueError('The stream offset is invalid.') from error
+        if offset < 0 or not payload or not payload.endswith(b'\n'):
+            raise ValueError('A nonempty, complete-line payload is required.')
+        with self._lock:
+            expected = self._remote_streams.get(stream_id)
+            end = offset + len(payload)
+            if expected is not None and end <= expected:
+                # Repair a state write that may have failed after the batch was
+                # already accepted in memory, before acknowledging the retry.
+                self._save_remote_ingest_state()
+                return {'accepted': 0, 'next_offset': expected, 'duplicate': True}
+            if expected is not None and offset != expected:
+                return {'accepted': 0, 'next_offset': expected, 'offset_mismatch': True}
+            processed = 0
+            for raw in payload.splitlines(keepends=True):
+                self._process_line(raw)
+                processed += 1
+            self._remote_streams[stream_id] = end
+            # Retain only a small rotation history.
+            if len(self._remote_streams) > 8:
+                for expired in list(self._remote_streams)[:-8]:
+                    del self._remote_streams[expired]
+            self._save_remote_ingest_state()
+            return {'accepted': processed, 'next_offset': end, 'duplicate': False}
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -139,6 +203,12 @@ class LiveLogService:
             self._thread.join(timeout=3)
         with self._lock:
             if self._state == 'active':
+                if self.remote:
+                    # Remote input has no source file to replay. Leave its
+                    # durable spool active so a planned backend restart can
+                    # continue the same pull.
+                    self._rebuild(force=True)
+                    return
                 self._emit_timeline(self.timeline_engine.interrupt('monitor_stopped'))
                 self._state = 'abandoned'
                 self._persist_snapshot('abandoned')
@@ -275,7 +345,10 @@ class LiveLogService:
                     self._persist_snapshot('completed')
                     if self._timeline:
                         self._completed.append(self._timeline)
+                    completed_spool = self._active_spool
                     self._active_spool = None
+                    if completed_spool:
+                        completed_spool.unlink(missing_ok=True)
 
     def _rebuild(self, force=False):
         spool = self._active_spool
@@ -352,6 +425,67 @@ class LiveLogService:
             except (OSError, ValueError, KeyError, TypeError):
                 pass
 
+    @staticmethod
+    def _same_encounter(left, right):
+        return (left.encounter_id == right.encounter_id
+                and abs(float(left.start) - float(right.start)) < 0.001)
+
+    def _recover_remote_spool(self):
+        """Restore a remote pull whose backend process stopped mid-encounter."""
+        spool = self.storage / f'{self.session_id}-active.log'
+        if not spool.is_file():
+            return
+        try:
+            refs = scan_encounters(spool)
+            if not refs:
+                return
+            ref = refs[-1]
+            if any(self._same_encounter(item['timeline'].encounter, ref)
+                   for item in self._archived.values()):
+                spool.unlink(missing_ok=True)
+                return
+
+            self._attempt += 1
+            ref.attempt = self._attempt
+            self._active_spool = spool
+            self._active_ref = ref
+            self._timeline = analyze_encounter(spool, ref)
+            self._last_start_signature = (ref.encounter_id, ref.start)
+            self._dirty = False
+            self._last_rebuild = time.monotonic()
+
+            encounter = TimelineEncounter(
+                self.session_id, f'{self.session_id}-{self._attempt:04d}', self._attempt,
+                ref.encounter_id, ref.name, ref.difficulty, ref.group_size, ref.start,
+            )
+            self.timeline_engine.start(encounter)
+            self._last_event_epoch = ref.start
+            with spool.open('rb') as source:
+                for raw in source:
+                    event = parse_event(decode_log_line(raw).rstrip('\r\n'))
+                    if event.timestamp is None:
+                        continue
+                    self._last_event_epoch = event.timestamp
+                    self._last_event_at = datetime.fromtimestamp(
+                        event.timestamp, timezone.utc,
+                    ).isoformat()
+                    if event.kind not in {'ENCOUNTER_START', 'ENCOUNTER_END'}:
+                        self.timeline_engine.tick(event.timestamp)
+
+            if ref.end is None:
+                self._state, self._error_code = 'active', None
+                return
+
+            self.timeline_engine.end(ref.success, ref.end)
+            self._state, self._error_code = 'completed', None
+            self._persist_snapshot('completed')
+            self._completed.append(self._timeline)
+            self._active_spool = None
+            spool.unlink(missing_ok=True)
+        except (OSError, ValueError, KeyError, TypeError):
+            self._active_spool = None
+            self._active_ref = None
+
     def completed(self):
         with self._lock:
             return list(self._completed)
@@ -399,11 +533,13 @@ class LiveLogService:
                 if duration is None and self._last_event_epoch is not None and self._active_ref:
                     duration = max(0.0, self._last_event_epoch - self._active_ref.start)
             return {
-                'schema_version': LIVE_SCHEMA_VERSION, 'source_type': 'local_live_log',
+                'schema_version': LIVE_SCHEMA_VERSION,
+                'source_type': 'remote_live_log' if self.remote else 'local_live_log',
                 'session_id': self.session_id, 'source_name': self.source_name,
                 'access_token_ready': True,
                 'access_token_fingerprint': self.access_token_fingerprint,
-                'configured': self.configured, 'available': bool(self.source and self.source.is_file()),
+                'configured': self.configured,
+                'available': self.remote or bool(self.source and self.source.is_file()),
                 'encounter_state': self._state, 'cursor': self._cursor,
                 'generated_at': datetime.now(timezone.utc).isoformat(),
                 'last_event_at': self._last_event_at, 'parse_errors': self._parse_errors,

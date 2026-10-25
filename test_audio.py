@@ -48,15 +48,18 @@ class PCMConverterTests(unittest.TestCase):
 class PCMPlaybackTests(unittest.TestCase):
     def test_partial_frames_are_combined_and_final_tail_is_padded(self):
         source = PCMPlayback()
+        self.assertTrue(source.is_idle())
         first = b"\x01\x02" * 100
         rest = b"\x03\x04" * ((source.FRAME - len(first)) // 2)
         source.push(first)
+        self.assertFalse(source.is_idle())
         self.assertEqual(source.read(), bytes(source.FRAME))
         source.push(rest + b"\x05\x06")
         self.assertEqual(source.read(), first + rest)
         source.finish_turn()
         self.assertEqual(source.read(), b"\x05\x06" + bytes(source.FRAME - 2))
         self.assertEqual(source.played_frames, 2)
+        self.assertTrue(source.is_idle())
 
     def test_clear_discards_queued_and_partial_audio(self):
         source = PCMPlayback()

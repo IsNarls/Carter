@@ -315,14 +315,15 @@ class DeathRecord:
     debuffs: list[dict] = field(default_factory=list)
 
 
-def scan_warcraft_logs_encounters(path: Path) -> list[EncounterRef]:
+def scan_warcraft_logs_encounters(path: Path, payload: dict | None = None) -> list[EncounterRef]:
     """Expose imported Warcraft Logs fights through the local encounter interface."""
     if __package__:
         from .warcraft_logs_importer import load_cache
     else:
         from warcraft_logs_importer import load_cache
 
-    report = load_cache(path)['report']
+    payload = load_cache(path) if payload is None else payload
+    report = payload['report']
     encounters = []
     for fight in report.get('fights', []):
         if not fight.get('encounterID'):
@@ -366,14 +367,15 @@ def _wcl_resource_health(resources, fallback=None) -> tuple[int, int] | None:
     return (current, maximum) if current >= 0 and maximum > 0 else None
 
 
-def analyze_warcraft_logs_encounter(path: Path, encounter: EncounterRef) -> EncounterTimeline:
+def analyze_warcraft_logs_encounter(path: Path, encounter: EncounterRef,
+                                    payload: dict | None = None) -> EncounterTimeline:
     """Normalize Warcraft Logs API events into the application's timeline model."""
     if __package__:
         from .warcraft_logs_importer import load_cache
     else:
         from warcraft_logs_importer import load_cache
 
-    payload = load_cache(path)
+    payload = load_cache(path) if payload is None else payload
     report = payload['report']
     master = report.get('masterData') or {}
     actors = {number(actor.get('id')): actor for actor in master.get('actors', [])}
@@ -381,7 +383,7 @@ def analyze_warcraft_logs_encounter(path: Path, encounter: EncounterRef) -> Enco
                  for ability in master.get('abilities', [])}
     fight_id = encounter.external_id
     if fight_id is None:
-        refs = scan_warcraft_logs_encounters(path)
+        refs = scan_warcraft_logs_encounters(path, payload)
         match = next((ref for ref in refs if ref.attempt == encounter.attempt), None)
         fight_id = match.external_id if match else None
     events = payload.get('eventsByFight', {}).get(str(fight_id), [])
@@ -860,12 +862,13 @@ def encounter_events(path: Path, encounter: EncounterRef) -> Iterator[Event]:
             yield parse_event(decode_log_line(raw).rstrip('\r\n'))
 
 
-def analyze_encounter(path: Path, encounter: EncounterRef) -> EncounterTimeline:
+def analyze_encounter(path: Path, encounter: EncounterRef, *,
+                      wcl_cache: dict | None = None) -> EncounterTimeline:
     if str(path).lower().endswith('.wcl.json'):
         cached = load_saved_analysis(path, encounter)
         if cached is not None:
             return cached
-        timeline = analyze_warcraft_logs_encounter(path, encounter)
+        timeline = analyze_warcraft_logs_encounter(path, encounter, wcl_cache)
         save_analysis(path, timeline)
         return timeline
     units: dict[str, Unit] = {}

@@ -61,7 +61,7 @@ class WakeWordTests(unittest.TestCase):
 
     def test_whole_name_in_partial_natural_utterance_triggers_once(self):
         recognizer = self.recognizer()
-        recognizer.results.append((False, "hey Carter tell me the time"))
+        recognizer.results.append((False, "Carter tell me the time"))
         self.assertTrue(self.detector.process(1, VOICE))
         self.assertEqual(recognizer.resets, 1)
         self.assertFalse(self.detector.process(1, VOICE))
@@ -82,7 +82,7 @@ class WakeWordTests(unittest.TestCase):
     def test_final_result_can_trigger_after_speech_ends(self):
         recognizer = self.recognizer()
         self.detector.process(1, VOICE)
-        recognizer.results.append((True, "hello carter"))
+        recognizer.results.append((True, "carter hello"))
         self.assertTrue(self.detector.process(1, SILENCE))
         self.assertEqual(recognizer.resets, 1)
         self.assertFalse(self.detector.process(1, SILENCE))
@@ -155,9 +155,21 @@ class WakeWordTests(unittest.TestCase):
         recognizer = Recognizer()
         detector = WakeWordDetector("", "hey carter", lambda: recognizer)
         self.addCleanup(detector.close)
-        recognizer.results.extend([(False, "hey there carter"), (False, "okay hey carter")])
+        recognizer.results.extend([(False, "hey there carter"), (False, "hey carter okay")])
         self.assertFalse(detector.process(1, VOICE))
         self.assertTrue(detector.process(1, VOICE))
+
+    def test_wake_phrase_after_other_words_does_not_trigger(self):
+        recognizer = self.recognizer()
+        recognizer.results.extend([
+            (False, "hello carter explain this"),
+            (False, "hey carter explain this"),
+            (False, "carter explain this"),
+        ])
+
+        self.assertFalse(self.detector.process(1, VOICE))
+        self.assertFalse(self.detector.process(1, VOICE))
+        self.assertTrue(self.detector.process(1, VOICE))
 
     def test_invalid_phrase_and_missing_model_have_clear_errors(self):
         with self.assertRaises(ValueError):

@@ -30,6 +30,7 @@ MAX_COMPARISON_FIGHTS = 20
 MAX_DEATHS = 500
 MAX_DEATH_CONTEXT_EVENTS = 500
 MAX_REPLAY_ACTORS = 100
+TANK_SPECIALIZATIONS = frozenset({'blood', 'brewmaster', 'guardian', 'protection', 'vengeance'})
 REPORT_ID = re.compile(r'^[A-Za-z0-9]{8,32}$')
 DRAFT_ID = re.compile(r'^[A-Za-z0-9._-]{1,160}$')
 
@@ -104,8 +105,7 @@ class AnalysisService:
 
     def list_reports(self):
         reports = []
-        for cache in sorted(self.storage.glob('warcraft-logs-*.wcl.json'),
-                            key=lambda item: item.stat().st_mtime_ns, reverse=True):
+        for cache in self.storage.glob('warcraft-logs-*.wcl.json'):
             report_id = cache.name[len('warcraft-logs-'):-len('.wcl.json')]
             meta = metadata_path(cache)
             record = {'report_id': report_id, 'downloaded_at_ns': cache.stat().st_mtime_ns,
@@ -119,7 +119,38 @@ class AnalysisService:
                 except (OSError, ValueError):
                     record['metadata_available'] = False
             reports.append(record)
+        reports.sort(
+            key=lambda item: (
+                int(item.get('endTime') or item.get('startTime') or 0),
+                int(item.get('downloaded_at_ns') or 0),
+                str(item.get('report_id') or ''),
+            ),
+            reverse=True,
+        )
         return {'schema_version': API_SCHEMA_VERSION, 'reports': reports}
+
+    def list_fights(self):
+        """Return every stored fight in encounter-time order, newest first."""
+        fights = []
+        for report in self.list_reports()['reports']:
+            if not report.get('metadata_available'):
+                continue
+            report_id = str(report.get('report_id') or '')
+            try:
+                payload = self.list_encounters(report_id)
+            except ServiceError:
+                continue
+            fights.extend(payload.get('fights', []))
+        fights.sort(
+            key=lambda item: (
+                int(item.get('start_time_ms') or 0),
+                int(item.get('end_time_ms') or 0),
+                str(item.get('report_id') or ''),
+                int(item.get('fight_id') or 0),
+            ),
+            reverse=True,
+        )
+        return {'schema_version': API_SCHEMA_VERSION, 'fights': fights}
 
     def get_report(self, report_id):
         _cache, data = self._metadata(report_id)
@@ -167,13 +198,19 @@ class AnalysisService:
 
     def list_encounters(self, report_id):
         _cache, data = self._metadata(report_id)
+        report_start = int(data.get('report', {}).get('startTime') or 0)
         fights = []
         for attempt, fight in enumerate(data.get('fights', []), 1):
             ref = self._ref(fight, attempt)
-            fights.append({'fight_id': ref.external_id, 'attempt': attempt,
+            relative_start = int(fight.get('startTime') or 0)
+            relative_end = int(fight.get('endTime') or 0)
+            fights.append({'report_id': report_id,
+                           'fight_id': ref.external_id, 'attempt': attempt,
                            'encounter_id': ref.encounter_id, 'name': ref.name,
                            'difficulty': ref.difficulty, 'size': ref.group_size,
-                           'duration_seconds': ref.duration, 'kill': ref.success})
+                           'duration_seconds': ref.duration, 'kill': ref.success,
+                           'start_time_ms': report_start + relative_start,
+                           'end_time_ms': report_start + relative_end})
         return {**self._base(report_id), 'fights': fights}
 
     def get_encounter(self, report_id, fight_id):
@@ -407,15 +444,52 @@ class AnalysisService:
 
     def get_death_answer(self, report_id, fight_id, death_id, seconds_before=10):
         timeline = self._timeline(report_id, fight_id)
-        return self._death_answer_payload(timeline, self._base(report_id, fight_id),
-                                          death_id, seconds_before)
+        tank_guids = self._stored_tank_guids(report_id, fight_id)
+        return self._death_answer_payload(
+            timeline, self._base(report_id, fight_id), death_id, seconds_before, tank_guids,
+        )
 
     def get_live_death_answer(self, death_id, seconds_before=10):
         timeline, status = self._live_snapshot()
         return self._death_answer_payload(timeline, self._live_base(timeline, status),
                                           death_id, seconds_before)
 
-    def _death_answer_payload(self, timeline, base, death_id, seconds_before):
+    @staticmethod
+    def _focused_map_roles(timeline, victim_guid, tank_guids=()):
+        roles = {str(victim_guid): 'player'}
+        for guid in tank_guids:
+            roles.setdefault(str(guid), 'tank')
+        # A multi-target encounter can expose many hostile units. Keep the primary
+        # parsed boss only so the positional diagram stays readable.
+        if timeline.boss_profiles:
+            encounter_name = str(timeline.encounter.name or '').casefold()
+            primary = next(
+                (boss for boss in timeline.boss_profiles
+                 if str(boss.name or '').casefold() == encounter_name),
+                timeline.boss_profiles[0],
+            )
+            roles.setdefault(str(primary.guid), 'boss')
+        return roles
+
+    def _stored_tank_guids(self, report_id, fight_id):
+        _cache, metadata, _ref = self._fight(report_id, fight_id)
+        fight = next(
+            (item for item in metadata.get('fights', [])
+             if int(item.get('id') or 0) == int(fight_id)),
+            {},
+        )
+        players = fight.get('friendlyPlayers') if isinstance(fight, dict) else []
+        specs = fight.get('friendlySpecs') if isinstance(fight, dict) else []
+        if not isinstance(players, list) or not isinstance(specs, list):
+            return []
+        return [
+            f'WCL-{int(player_id)}'
+            for player_id, spec in zip(players, specs)
+            if str(spec or '').casefold() in TANK_SPECIALIZATIONS
+        ][:2]
+
+    def _death_answer_payload(self, timeline, base, death_id, seconds_before,
+                              tank_guids=()):
         # Capture one timeline so live analysis, replay, and image agree.
         death = self._death(timeline, death_id=death_id)
         analysis = self._death_analysis_payload(death, base, seconds_before)
@@ -423,7 +497,8 @@ class AnalysisService:
                                              analysis['seconds_before'], 0, 100)
         names = {p.guid: p.name for p in timeline.players}
         names.update({p.guid: p.name for p in timeline.boss_profiles})
-        return {**base, **build_death_answer(analysis, replay, names)}
+        roles = self._focused_map_roles(timeline, analysis['player']['id'], tank_guids)
+        return {**base, **build_death_answer(analysis, replay, names, roles)}
 
     def compare_player_deaths(self, report_id, fight_ids, player_id=None, player_name=None):
         selected = self._fight_ids(fight_ids)
@@ -450,7 +525,8 @@ class AnalysisService:
     def _live_base(timeline, status):
         encounter = timeline.encounter
         return {
-            'schema_version': API_SCHEMA_VERSION, 'source_type': 'local_live_log',
+            'schema_version': API_SCHEMA_VERSION,
+            'source_type': status.get('source_type', 'local_live_log'),
             'session_id': status['session_id'], 'encounter_id': encounter.encounter_id,
             'attempt': encounter.attempt, 'encounter_state': status['encounter_state'],
             'cursor': status['cursor'], 'generated_at': status['generated_at'],
