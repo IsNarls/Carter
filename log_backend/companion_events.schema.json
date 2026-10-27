@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Carter Companion event request v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "events"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "event_id",
+              "session_id",
+              "attempt_id",
+              "sequence",
+              "encounter_id",
+              "difficulty_id",
+              "log_timestamp",
+              "detected_at",
+              "type"
+            ],
+            "properties": {
+              "event_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "attempt_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "encounter_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "difficulty_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "log_timestamp": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+              },
+              "detected_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+              },
+              "type": {
+                "const": "ENCOUNTER_STARTED"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "event_id",
+              "session_id",
+              "attempt_id",
+              "sequence",
+              "encounter_id",
+              "difficulty_id",
+              "log_timestamp",
+              "detected_at",
+              "type",
+              "profile_id",
+              "profile_revision",
+              "mechanic_id",
+              "occurrence"
+            ],
+            "properties": {
+              "event_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "attempt_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "encounter_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "difficulty_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "log_timestamp": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+              },
+              "detected_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+              },
+              "type": {
+                "const": "MECHANIC_OBSERVED"
+              },
+              "profile_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"
+              },
+              "profile_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "mechanic_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$"
+              },
+              "occurrence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "event_id",
+              "session_id",
+              "attempt_id",
+              "sequence",
+              "encounter_id",
+              "difficulty_id",
+              "log_timestamp",
+              "detected_at",
+              "type",
+              "result"
+            ],
+            "properties": {
+              "event_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "attempt_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "format": "uuid"
+              },
+              "sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "encounter_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "difficulty_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "log_timestamp": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+              },
+              "detected_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|\\+00:00)$"
+              },
+              "type": {
+                "const": "ENCOUNTER_ENDED"
+              },
+              "result": {
+                "enum": [
+                  "KILL",
+                  "WIPE"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -140,6 +140,7 @@ class SpeechProvider(Protocol):
     async def connect(self): ...
     async def start_audio(self): ...
     async def send_audio(self, pcm: bytes): ...
+    async def send_text(self, text: str): ...
     def receive_audio(self) -> AsyncIterator[ProviderEvent]: ...
     async def end_audio(self): ...
     async def send_tool_results(self, results): ...
@@ -269,6 +270,21 @@ class GeminiProvider:
         _validate_pcm(pcm)
         self._connected()
         await self._send(audio=self._types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+
+    async def send_text(self, text):
+        text = _fixed_speech_text(text)
+        try:
+            await asyncio.wait_for(
+                self._connected().send_client_content(
+                    turns=self._types.Content(
+                        role="user", parts=[self._types.Part(text=text)],
+                    ),
+                    turn_complete=True,
+                ),
+                self.settings.io_timeout,
+            )
+        except Exception as error:
+            raise _provider_error(error) from None
 
     async def start_audio(self):
         await self._send(activity_start=self._types.ActivityStart())
@@ -465,6 +481,17 @@ class OpenAIProvider:
                           "audio": base64.b64encode(pcm).decode("ascii")})
         self._has_audio = True
 
+    async def send_text(self, text):
+        text = _fixed_speech_text(text)
+        await self._send({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+        await self._send({"type": "response.create"})
+
     async def start_audio(self):
         # OpenAI's configured server VAD starts automatically on appended PCM.
         return None
@@ -536,3 +563,10 @@ def create_provider(name, settings):
     except KeyError:
         raise ValueError("Provider must be gemini or openai") from None
     return factory(settings)
+
+
+def _fixed_speech_text(value):
+    value = str(value or "").strip()
+    if not value or len(value) > 240 or any(character in value for character in "\r\n\0"):
+        raise ProviderError("invalid_speech_text")
+    return value

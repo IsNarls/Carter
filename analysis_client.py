@@ -185,6 +185,31 @@ class AnalysisClient:
     async def live_status(self):
         return await self._request("GET", "live/status")
 
+    async def live_announcement_source(self, source=None):
+        if source is None:
+            return await self._request("GET", "live/announcement-source")
+        if source not in {"raw_log", "companion"}:
+            raise AnalysisClientError("invalid_announcement_source")
+        return await self._request("POST", "live/announcement-source", payload={"source": source})
+
+    async def live_announcement_status(self):
+        return await self._request("GET", "live/announcements/status")
+
+    async def live_announcement_updates(self, since=0, limit=100):
+        return await self._request("GET", "live/announcements", params={
+            "since": max(0, int(since)), "limit": _limit(limit, maximum=500),
+        })
+
+    async def live_updates(self, since: int = 0, limit: int = 100):
+        try:
+            cursor = max(0, int(since))
+        except (TypeError, ValueError):
+            raise AnalysisClientError("invalid_cursor") from None
+        return await self._request(
+            "GET", "live/updates",
+            params={"since": cursor, "limit": _limit(limit, maximum=500)},
+        )
+
     async def live_summary(self):
         return await self._request("GET", "live/summary")
 
@@ -419,9 +444,9 @@ def _metric(value: str) -> str:
     return value
 
 
-def _limit(value: int) -> int:
+def _limit(value: int, maximum: int = 50) -> int:
     try:
-        return min(max(1, int(value)), 50)
+        return min(max(1, int(value)), maximum)
     except (TypeError, ValueError):
         raise AnalysisClientError("invalid_limit") from None
 

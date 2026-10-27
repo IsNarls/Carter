@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from datetime import datetime
 import fcntl
 import io
 import logging
+import math
 import os
 import time
 import traceback
@@ -25,7 +28,7 @@ from raid_integration import (
     GuildSettingsStore, REPORT_URL, RaidAnalysis, RaidAnswer, analysis_tool_declaration,
     user_error,
 )
-from session import SessionLimits, VoiceSession
+from session import FixedSpeechPlayer, SessionLimits, VoiceSession
 from wake_listener import WakeListener, WakeSettings
 
 
@@ -91,6 +94,13 @@ def analysis_backend_configuration(settings):
     return bool(settings.enabled and managed), startup_timeout, health_interval
 
 
+def live_announcement_configuration():
+    """Return bounded polling and combat-log freshness settings."""
+    max_age = bounded_int("CARTER_LIVE_ANNOUNCEMENT_MAX_AGE_SECONDS", 15, 1, 300)
+    poll_ms = bounded_int("CARTER_LIVE_ANNOUNCEMENT_POLL_MS", 100, 100, 5000)
+    return max_age, poll_ms / 1000
+
+
 def ai_configuration(*, analysis_tools=False):
     if os.getenv("CARTER_AI_PROVIDER", "gemini").strip().lower() != "gemini":
         raise ConfigurationError("CARTER_AI_PROVIDER must be gemini; OpenAI is opt-in fallback only")
@@ -144,6 +154,7 @@ class GuildRuntime:
             return await bot._voice_analysis_tool(self, call)
 
         self.session = VoiceSession(settings, limits, tool_handler=on_tool)
+        self.live_announcer = FixedSpeechPlayer(settings)
 
         async def on_wake(user_id, voice, generation):
             return await bot._wake_activate(self, user_id, voice, generation)
@@ -159,13 +170,28 @@ class GuildRuntime:
         self.importing: dict[str, asyncio.Task] = {}
         self.history_import_task: asyncio.Task | None = None
         self.replay_active = False
+        self.live_logging_enabled = False
+        self.live_monitor_task: asyncio.Task | None = None
+        self.live_announcement_tasks: set[asyncio.Task] = set()
+        self.live_announcement_metadata: dict[asyncio.Task, tuple[str, str]] = {}
+        self.live_announcement_lock = asyncio.Lock()
+        self.live_announcement_active = False
+        self.live_cursor = 0
+        self.live_session_id = None
+        self.live_feed_id = None
+        self.live_last_error = None
+        self.live_seen = set()
+        self.live_seen_order = deque()
+        self.live_announcement_source = "raw_log"
+        self.live_closed_attempts = deque(maxlen=500)
 
 
 class Carter(discord.Client):
     def __init__(self, legacy_guild_id, allowed_users, settings=None, limits=SessionLimits(),
                  wake_settings=None, analysis_settings=AnalysisClientSettings(), *,
                  monitor_log_channel=True, backend_controller=None,
-                 backend_health_interval=15):
+                 backend_health_interval=15, live_announcement_max_age=15,
+                 live_announcement_poll_interval=0.5):
         settings = settings or ProviderSettings()
         wake_settings = wake_settings or WakeSettings(auto_join=False)
         intents = discord.Intents.none()
@@ -184,6 +210,10 @@ class Carter(discord.Client):
         self.monitor_log_channel = bool(monitor_log_channel)
         self.backend_controller = backend_controller
         self.backend_health_interval = max(5, int(backend_health_interval))
+        self.live_announcement_max_age = max(1, int(live_announcement_max_age))
+        self.live_announcement_poll_interval = min(
+            5.0, max(0.1, float(live_announcement_poll_interval)),
+        )
         self.backend_supervisor_task = None
         self.backend_recovery_lock = asyncio.Lock()
         self.analysis_client = AnalysisClient(analysis_settings)
@@ -217,6 +247,9 @@ class Carter(discord.Client):
 
         logs = app_commands.Group(name="logs", description="Prepared raid-log analysis")
         logs.command(name="health", description="Check the analysis backend")(self.logs_health)
+        logs.command(name="live", description="Control live encounter voice announcements")(
+            self.logs_live,
+        )
         logs.command(name="reports", description="List prepared reports")(self.logs_reports)
         logs.command(name="fights", description="List fights in a prepared report")(self.logs_fights)
         logs.command(name="select", description="Select a prepared report and optional fight")(
@@ -417,7 +450,7 @@ class Carter(discord.Client):
             if (generation != state.wake.generation or not state.wake.running
                     or state.wake.voice is not voice or not voice.is_connected()
                     or voice.channel.id != state.channel_id or state.session.active
-                    or state.replay_active
+                    or state.replay_active or state.live_announcement_active
                     or user_id not in self.allowed_users):
                 return False
             member = voice.guild.get_member(user_id)
@@ -663,9 +696,9 @@ class Carter(discord.Client):
                     or voice.channel.id != state.channel_id):
                 await interaction.followup.send("Join the saved voice channel first.", ephemeral=True)
                 return
-            if state.session.active:
+            if state.session.active or state.live_announcement_active:
                 await interaction.followup.send(
-                    "A conversation is active. Use `/carter stop` first.", ephemeral=True,
+                    "Carter is already speaking or listening. Try again shortly.", ephemeral=True,
                 )
                 return
 
@@ -718,7 +751,8 @@ class Carter(discord.Client):
                     "Join the saved voice channel first.", ephemeral=True,
                 )
                 return
-            if state.session.active or state.replay_active:
+            if (state.session.active or state.replay_active
+                    or state.live_announcement_active):
                 await interaction.followup.send(
                     "Carter is already speaking or listening.", ephemeral=True,
                 )
@@ -786,7 +820,9 @@ class Carter(discord.Client):
             f"voice channel set: {bool(state.channel_id)}; log channel set: {bool(state.logs_channel_id)}; "
             f"wake listener: {state.wake.state}; AI: {session.state}; provider: {session.provider_name}; "
             f"model: {model}; analysis backend: {backend}; analysis source: "
-            f"{state.analysis_state.source}; OpenAI fallback enabled: {session.limits.allow_fallback}; "
+            f"{state.analysis_state.source}; live logging: "
+            f"{'on' if state.live_logging_enabled else 'off'}; "
+            f"OpenAI fallback enabled: {session.limits.allow_fallback}; "
             f"audio sent/generated: {session.input_seconds:.1f}s/{session.output_seconds:.1f}s; "
             f"mic frames/turns/provider events/tools: {session.input_frames}/"
             f"{session.speech_turns}/{session.provider_events}/{session.tool_calls}; "
@@ -795,6 +831,431 @@ class Carter(discord.Client):
             f"{session.last_error or state.wake.last_error or 'none'}{token_status}.",
             ephemeral=True,
         )
+
+    async def logs_live(self, interaction: discord.Interaction,
+                        mode: Literal["on", "off", "status"] = "status",
+                        source: Literal["raw_log", "companion"] | None = None):
+        """Opt in one guild to fresh live encounter announcements."""
+        if not await self.authorize(interaction):
+            return
+        state = self.runtime(interaction.guild_id)
+        if source is not None:
+            if not self.analysis_settings.enabled:
+                await interaction.followup.send("Raid-log analysis is disabled.", ephemeral=True)
+                return
+            try:
+                selected = await self._analysis_request(
+                    lambda: state.raid.client.live_announcement_source(source))
+            except AnalysisClientError as error:
+                await interaction.followup.send(user_error(error), ephemeral=True)
+                return
+            was_enabled = state.live_logging_enabled
+            await self._stop_live_logging(state)
+            state.live_announcement_source = selected["announcement_source"]
+            if was_enabled and mode == "status":
+                mode = "on"
+        if mode == "status":
+            if source is None and self.analysis_settings.enabled:
+                try:
+                    selected = await self._analysis_request(
+                        state.raid.client.live_announcement_source)
+                    state.live_announcement_source = selected["announcement_source"]
+                except AnalysisClientError as error:
+                    await interaction.followup.send(user_error(error), ephemeral=True)
+                    return
+            await interaction.followup.send(
+                self._live_logging_status(state), ephemeral=True,
+            )
+            return
+        if mode == "off":
+            await self._stop_live_logging(state)
+            await interaction.followup.send(
+                "Live logging is off for this server. Encounter announcements are disabled.",
+                ephemeral=True,
+            )
+            return
+        if not self.analysis_settings.enabled:
+            await interaction.followup.send(
+                "Live logging cannot start because raid-log analysis is disabled.",
+                ephemeral=True,
+            )
+            return
+        if state.live_logging_enabled:
+            await interaction.followup.send(
+                self._live_logging_status(state), ephemeral=True,
+            )
+            return
+        try:
+            status = await self._analysis_request(state.raid.client.live_announcement_status)
+        except AnalysisClientError as error:
+            log.warning(
+                "Live logging enable failed: guild=%s reason=%s",
+                state.guild_id, error.code,
+            )
+            await interaction.followup.send(user_error(error), ephemeral=True)
+            return
+        if not status.get("configured") or not status.get("available"):
+            await interaction.followup.send(
+                "The live combat-log source is not available, so live logging was not enabled.",
+                ephemeral=True,
+            )
+            return
+        state.live_cursor = max(0, int(status.get("cursor") or 0))
+        state.live_session_id = str(status.get("session_id") or "") or None
+        state.live_feed_id = (
+            str(status.get("feed_id") or "") or state.live_session_id
+        )
+        state.live_last_error = None
+        state.live_announcement_source = status.get("announcement_source", "raw_log")
+        state.live_closed_attempts.clear()
+        state.live_seen.clear()
+        state.live_seen_order.clear()
+        state.live_logging_enabled = True
+        state.live_monitor_task = asyncio.create_task(
+            self._monitor_live_encounters(state),
+            name=f"carter-live-log-{state.guild_id}",
+        )
+        voice = interaction.guild.voice_client
+        connected = bool(
+            voice and voice.is_connected() and voice.channel
+            and voice.channel.id == state.channel_id
+        )
+        log.info(
+            "Live logging enabled: guild=%s session=%s cursor=%s voice_connected=%s",
+            state.guild_id, state.live_session_id or "unknown", state.live_cursor, connected,
+        )
+        message = (
+            "Live logging is on for this server. Carter will announce fresh encounter starts, "
+            "ends, and any matched guide callouts "
+            f"(up to {self.live_announcement_max_age} seconds old)."
+        )
+        if not connected:
+            message += " Carter is not in the saved voice channel; use `/carter join` when ready."
+        await interaction.followup.send(message, ephemeral=True)
+
+    def _live_logging_status(self, state):
+        value = "on" if state.live_logging_enabled else "off"
+        detail = f" Last monitor error: {state.live_last_error}." if state.live_last_error else ""
+        return (
+            f"Live logging is {value} for this server; announcement source: "
+            f"{state.live_announcement_source}. The freshness limit is "
+            f"{self.live_announcement_max_age} seconds.{detail}"
+        )
+
+    async def _stop_live_logging(self, state):
+        state.live_logging_enabled = False
+        current = asyncio.current_task()
+        monitor = state.live_monitor_task
+        state.live_monitor_task = None
+        if monitor is not None and monitor is not current and not monitor.done():
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+        tasks = [task for task in state.live_announcement_tasks
+                 if task is not current and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        state.live_announcement_tasks.clear()
+        state.live_announcement_metadata.clear()
+        state.live_announcement_active = False
+
+    async def _monitor_live_encounters(self, state):
+        """Poll only this guild's private loopback feed and dispatch lifecycle events."""
+        while state.live_logging_enabled:
+            try:
+                payload = await self._analysis_request(
+                    lambda: state.raid.client.live_announcement_updates(state.live_cursor, 100),
+                )
+            except AnalysisClientError as error:
+                if error.code == "CURSOR_EXPIRED":
+                    state.live_cursor = max(0, int(error.details.get("oldest_cursor") or 1) - 1)
+                    reason = "cursor_expired"
+                else:
+                    reason = error.code
+                if state.live_last_error != reason:
+                    log.warning(
+                        "Live logging monitor unavailable: guild=%s reason=%s",
+                        state.guild_id, reason,
+                    )
+                state.live_last_error = reason
+                await asyncio.sleep(self.live_announcement_poll_interval)
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                reason = type(error).__name__
+                if state.live_last_error != reason:
+                    log.warning(
+                        "Live logging monitor failed: guild=%s reason=%s",
+                        state.guild_id, reason,
+                    )
+                state.live_last_error = reason
+                await asyncio.sleep(self.live_announcement_poll_interval)
+                continue
+
+            state.live_last_error = None
+            session_id = str(payload.get("session_id") or "") or None
+            feed_id = str(payload.get("feed_id") or "") or session_id
+            payload_cursor = max(0, int(payload.get("cursor") or 0))
+            if (session_id != state.live_session_id
+                    or feed_id != state.live_feed_id
+                    or payload_cursor < state.live_cursor):
+                # Feed/source changes invalidate all pending speech from the old producer.
+                for pending in list(state.live_announcement_tasks):
+                    pending.cancel()
+                state.live_closed_attempts.clear()
+                state.live_announcement_source = payload.get("announcement_source", "raw_log")
+                log.info(
+                    "Live logging stream reset: guild=%s old_session=%s new_session=%s "
+                    "old_feed=%s new_feed=%s old_cursor=%s new_cursor=%s",
+                    state.guild_id, state.live_session_id or "unknown",
+                    session_id or "unknown", state.live_feed_id or "unknown",
+                    feed_id or "unknown", state.live_cursor, payload_cursor,
+                )
+                state.live_session_id = session_id
+                state.live_feed_id = feed_id
+                state.live_cursor = 0
+                state.live_seen.clear()
+                state.live_seen_order.clear()
+                continue
+
+            updates = payload.get("updates")
+            if not isinstance(updates, list):
+                updates = []
+            for event in updates:
+                if not isinstance(event, dict):
+                    continue
+                state.live_cursor = max(state.live_cursor, int(event.get("cursor") or 0))
+                self._queue_live_lifecycle(state, event)
+            if payload.get("truncated"):
+                continue
+            await asyncio.sleep(self.live_announcement_poll_interval)
+
+    def _queue_live_lifecycle(self, state, event):
+        """Validate and queue lifecycle, test, or curated guide speech."""
+        event_type = str(event.get("type") or "")
+        is_test = event_type == "ANNOUNCEMENT_TEST_REQUESTED"
+        is_callout = event_type == "MECHANIC_CALLOUT"
+        if event_type not in {
+                "ENCOUNTER_STARTED", "ENCOUNTER_ENDED", "ANNOUNCEMENT_TEST_REQUESTED",
+                "MECHANIC_CALLOUT"}:
+            return
+        attempt_id = str(event.get("attempt_id") or event.get("request_id") or "")
+        attempt_key = (str(event.get("session_id") or ""), attempt_id)
+        if event_type == "ENCOUNTER_ENDED":
+            # Close even an expired result: queued mechanics must never outlive the fight.
+            if attempt_key not in state.live_closed_attempts:
+                state.live_closed_attempts.append(attempt_key)
+            for pending, metadata in list(state.live_announcement_metadata.items()):
+                if metadata == (attempt_id, "MECHANIC_CALLOUT") and not pending.done():
+                    pending.cancel()
+        elif is_callout and attempt_key in state.live_closed_attempts:
+            return
+        elif event_type == "ENCOUNTER_STARTED" and event.get("announcement_source") == "companion":
+            for pending, metadata in list(state.live_announcement_metadata.items()):
+                if metadata[1] == "MECHANIC_CALLOUT" and metadata[0] != attempt_id:
+                    pending.cancel()
+        boss_name = " ".join(str(event.get("encounter_name") or "").split())[:120]
+        encounter_id = event.get("encounter_id")
+        result = str(event.get("result") or "").upper() or None
+        mechanic_id = str(event.get("mechanic_id") or "")[:80]
+        try:
+            occurrence = int(event.get("occurrence")) if is_callout else None
+        except (TypeError, ValueError):
+            occurrence = None
+        callout_text = " ".join(str(event.get("message") or "").split())[:240]
+        callout_text_valid = bool(callout_text) and all(
+            ord(character) >= 32 for character in callout_text)
+        # Prefer the combat-log timestamp and calculate age at dispatch time.
+        # The backend's event_age_seconds is only an ingest-time snapshot and
+        # must not keep a retained update artificially fresh while it waits to
+        # be polled.  Events without a log timestamp (the authenticated test
+        # button) accrue elapsed time from their backend receipt timestamp.
+        try:
+            timestamp_field = (
+                "log_end_timestamp"
+                if event_type == "ENCOUNTER_ENDED" else "effective_log_timestamp"
+            )
+            event_timestamp = float(event[timestamp_field])
+            if not math.isfinite(event_timestamp):
+                raise ValueError
+            age = max(0.0, time.time() - event_timestamp)
+        except (KeyError, TypeError, ValueError):
+            try:
+                age = float(event.get("event_age_seconds"))
+                if not math.isfinite(age):
+                    raise ValueError
+                age = max(0.0, age)
+                received_at = event.get("received_at")
+                if received_at:
+                    received = datetime.fromisoformat(
+                        str(received_at).replace("Z", "+00:00"))
+                    if received.tzinfo is None:
+                        raise ValueError
+                    age += max(0.0, time.time() - received.timestamp())
+            except (TypeError, ValueError, OverflowError):
+                age = None
+        allowed_age = float(self.live_announcement_max_age)
+        if is_callout:
+            try:
+                profile_age = float(event.get("max_lateness_seconds"))
+                if not math.isfinite(profile_age) or profile_age <= 0:
+                    raise ValueError
+                allowed_age = min(allowed_age, profile_age)
+            except (TypeError, ValueError):
+                allowed_age = 0.0
+        if is_test:
+            log.info(
+                "Live announcement test received: guild=%s request=%s event_age_seconds=%s",
+                state.guild_id, attempt_id or "missing",
+                f"{age:.3f}" if age is not None else "unknown",
+            )
+        elif is_callout:
+            log.info(
+                "Live guide callout received: guild=%s attempt=%s boss=%s "
+                "encounter_id=%s profile=%s mechanic=%s occurrence=%s "
+                "event_age_seconds=%s",
+                state.guild_id, attempt_id or "missing", boss_name or "missing",
+                encounter_id if encounter_id is not None else "missing",
+                str(event.get("profile_id") or "missing")[:80], mechanic_id or "missing",
+                occurrence if occurrence is not None else "missing",
+                f"{age:.3f}" if age is not None else "unknown",
+            )
+        else:
+            log.info(
+                "Live encounter lifecycle received: guild=%s attempt=%s boss=%s "
+                "encounter_id=%s result=%s event_age_seconds=%s",
+                state.guild_id, attempt_id or "missing", boss_name or "missing",
+                encounter_id if encounter_id is not None else "missing", result or "n/a",
+                f"{age:.3f}" if age is not None else "unknown",
+            )
+        identity = ((mechanic_id, occurrence) if is_callout else event_type)
+        key = (str(event.get("session_id") or state.live_session_id or ""),
+               attempt_id, event_type, identity)
+        if key in state.live_seen:
+            log.info(
+                "Live encounter announcement suppressed: guild=%s attempt=%s event=%s "
+                "reason=duplicate",
+                state.guild_id, attempt_id or "missing", event_type,
+            )
+            return
+        if len(state.live_seen_order) >= 500:
+            state.live_seen.discard(state.live_seen_order.popleft())
+        state.live_seen.add(key)
+        state.live_seen_order.append(key)
+        if not state.live_logging_enabled:
+            reason = "live_logging_disabled"
+        elif not attempt_id:
+            reason = "invalid_lifecycle_event"
+        elif not is_test and (not boss_name or encounter_id is None):
+            reason = "invalid_lifecycle_event"
+        elif is_callout and (not mechanic_id or occurrence is None or occurrence < 1
+                             or not callout_text_valid or allowed_age <= 0):
+            reason = "invalid_guide_callout"
+        elif age is None:
+            reason = "event_age_unavailable"
+        elif age > allowed_age:
+            reason = "stale_event"
+        elif event_type == "ENCOUNTER_ENDED" and result not in {"KILL", "WIPE"}:
+            reason = "invalid_encounter_result"
+        else:
+            reason = None
+        if reason:
+            log.info(
+                "Live encounter announcement suppressed: guild=%s attempt=%s event=%s "
+                "reason=%s event_age_seconds=%s",
+                state.guild_id, attempt_id or "missing", event_type, reason,
+                f"{age:.3f}" if age is not None else "unknown",
+            )
+            return
+        if is_test:
+            text = "I have received the test prompt"
+        elif is_callout:
+            text = callout_text
+        else:
+            text = (f"Good luck on {boss_name}!" if event_type == "ENCOUNTER_STARTED"
+                    else "Good job!" if result == "KILL" else "That sucks!")
+        if event_type == "ENCOUNTER_ENDED":
+            # A result is authoritative for the attempt.  Stop any tactical
+            # guidance that is queued or currently playing so it cannot trail
+            # the kill/wipe announcement.
+            for pending, metadata in list(state.live_announcement_metadata.items()):
+                pending_attempt, pending_type = metadata
+                if (pending_attempt == attempt_id
+                        and pending_type == "MECHANIC_CALLOUT"
+                        and not pending.done()):
+                    pending.cancel()
+        expires_at = time.monotonic() + max(0.0, allowed_age - (age or 0.0))
+        task_suffix = f"{attempt_id}-{mechanic_id}-{occurrence}" if is_callout else attempt_id
+        task = asyncio.create_task(
+            self._deliver_live_announcement(
+                state, attempt_id, event_type, text, expires_at=expires_at),
+            name=f"carter-live-announcement-{state.guild_id}-{task_suffix}",
+        )
+        state.live_announcement_tasks.add(task)
+        state.live_announcement_metadata[task] = (attempt_id, event_type)
+
+        def forget(completed):
+            state.live_announcement_tasks.discard(completed)
+            state.live_announcement_metadata.pop(completed, None)
+
+        task.add_done_callback(forget)
+        log.info(
+            "Live encounter announcement queued: guild=%s attempt=%s event=%s",
+            state.guild_id, attempt_id, event_type,
+        )
+
+    async def _deliver_live_announcement(self, state, attempt_id, event_type, text,
+                                         *, expires_at=None):
+        try:
+            async with state.live_announcement_lock:
+                async with state.voice_lock:
+                    if expires_at is not None and time.monotonic() > expires_at:
+                        reason = "expired_in_queue"
+                    elif not state.live_logging_enabled:
+                        reason = "live_logging_disabled"
+                    else:
+                        guild = self.get_guild(state.guild_id)
+                        voice = getattr(guild, "voice_client", None) if guild else None
+                        if (not state.want_voice or not voice or not voice.is_connected()
+                                or not voice.channel or voice.channel.id != state.channel_id):
+                            reason = "voice_unavailable"
+                        elif (state.session.active or state.replay_active
+                              or state.live_announcement_active or voice.is_playing()):
+                            reason = "voice_busy"
+                        else:
+                            reason = None
+                    if reason:
+                        method = log.info if reason == "expired_in_queue" else log.warning
+                        method(
+                            "Live encounter announcement %s: guild=%s attempt=%s event=%s "
+                            "reason=%s",
+                            "suppressed" if reason == "expired_in_queue" else "failed",
+                            state.guild_id, attempt_id, event_type, reason)
+                        return
+                    state.live_announcement_active = True
+                    try:
+                        await state.live_announcer.speak(voice, text)
+                    finally:
+                        state.live_announcement_active = False
+            log.info(
+                "Live encounter announcement completed: guild=%s attempt=%s event=%s",
+                state.guild_id, attempt_id, event_type,
+            )
+        except asyncio.CancelledError:
+            log.info(
+                "Live encounter announcement suppressed: guild=%s attempt=%s event=%s "
+                "reason=cancelled",
+                state.guild_id, attempt_id, event_type,
+            )
+            raise
+        except Exception as error:
+            code = error.code if isinstance(error, ProviderError) else type(error).__name__
+            log.warning(
+                "Live encounter announcement failed: guild=%s attempt=%s event=%s reason=%s",
+                state.guild_id, attempt_id, event_type, code,
+            )
 
     async def logs_health(self, interaction: discord.Interaction):
         if not await self.authorize(interaction):
@@ -1377,6 +1838,7 @@ class Carter(discord.Client):
                 await asyncio.gather(self.backend_supervisor_task, return_exceptions=True)
                 self.backend_supervisor_task = None
             for state in self.guilds_runtime.values():
+                await self._stop_live_logging(state)
                 for task in list(state.import_tasks):
                     task.cancel()
                 if state.import_tasks:
@@ -1515,6 +1977,7 @@ def main():
     manage_backend, backend_startup_timeout, backend_health_interval = \
         analysis_backend_configuration(analysis_settings)
     settings, limits = ai_configuration(analysis_tools=analysis_settings.enabled)
+    live_max_age, live_poll_interval = live_announcement_configuration()
     with (ROOT / ".carter.lock").open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1545,6 +2008,8 @@ def main():
                 analysis_settings, monitor_log_channel=monitor,
                 backend_controller=backend_controller,
                 backend_health_interval=backend_health_interval,
+                live_announcement_max_age=live_max_age,
+                live_announcement_poll_interval=live_poll_interval,
             )
             bot.run(token, log_handler=None)
         finally:

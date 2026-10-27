@@ -98,6 +98,34 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             session.requests[0][2]["headers"], {"X-Carter-Guild-ID": "123456789"},
         )
 
+    async def test_live_updates_are_bounded_and_guild_scoped(self):
+        session = FakeSession([FakeResponse(200, {"updates": [], "cursor": 44})])
+        client = AnalysisClient(AnalysisClientSettings(True), session).for_guild(123456789)
+
+        await client.live_updates(40, 100)
+
+        method, url, kwargs = session.requests[0]
+        self.assertEqual(method, "GET")
+        self.assertTrue(url.endswith("/live/updates"))
+        self.assertEqual(kwargs["params"], {"since": 40, "limit": 100})
+        self.assertEqual(
+            kwargs["headers"], {"X-Carter-Guild-ID": "123456789"},
+        )
+
+    async def test_selected_announcement_routes_are_guild_scoped(self):
+        session = FakeSession([FakeResponse(200, {}) for _ in range(4)])
+        client = AnalysisClient(AnalysisClientSettings(True), session).for_guild(123456789)
+        await client.live_announcement_source('companion')
+        await client.live_announcement_source()
+        await client.live_announcement_status()
+        await client.live_announcement_updates(12, 100)
+        self.assertEqual(session.requests[0][0], 'POST')
+        self.assertEqual(session.requests[0][2]['json'], {'source': 'companion'})
+        self.assertTrue(session.requests[-1][1].endswith('/live/announcements'))
+        self.assertEqual(session.requests[-1][2]['params'], {'since': 12, 'limit': 100})
+        for _, _, kwargs in session.requests:
+            self.assertEqual(kwargs['headers'], {'X-Carter-Guild-ID': '123456789'})
+
     async def test_structured_error_is_sanitized(self):
         session = FakeSession([FakeResponse(409, {
             "error": {"code": "AMBIGUOUS_PLAYER", "message": "private detail",

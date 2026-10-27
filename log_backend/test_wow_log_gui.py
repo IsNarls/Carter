@@ -14,7 +14,7 @@ if __package__:
                               fetch_live_pipeline_snapshot,
                               group_cross_report_encounters, guild_data_directory,
                               live_pipeline_completed_row, live_pipeline_timestamp,
-                              live_pipeline_update_row,
+                              live_pipeline_update_row, live_pipeline_sender_text,
                               newest_report_keys,
                               prepare_fight_module, report_modified_text, report_path_key,
                               read_console_update, redact_console_text, saved_guild_ids,
@@ -29,7 +29,7 @@ else:
                              fetch_live_pipeline_snapshot,
                              group_cross_report_encounters, guild_data_directory,
                              live_pipeline_completed_row, live_pipeline_timestamp,
-                             live_pipeline_update_row,
+                             live_pipeline_update_row, live_pipeline_sender_text,
                              newest_report_keys,
                              prepare_fight_module, report_modified_text, report_path_key,
                              read_console_update, redact_console_text, saved_guild_ids,
@@ -162,6 +162,17 @@ class LivePipelineGuiTests(unittest.TestCase):
         self.assertEqual(completed, ('3', 'Test Boss', 'Kill', '92.2s', '1'))
         self.assertNotIn('/private/path', ' '.join(completed))
 
+        callout = live_pipeline_update_row({
+            'timestamp': '2026-10-25T19:34:04+00:00',
+            'type': 'MECHANIC_CALLOUT', 'encounter_name': 'Known Boss',
+            'mechanic_id': 'group_soak', 'message': 'Group soak.',
+            'evidence': 'private review notes', 'raw_line': 'private raw line',
+        })
+        self.assertEqual(callout[1], 'MECHANIC_CALLOUT')
+        self.assertIn('Known Boss', callout[2])
+        self.assertIn('Group soak.', callout[2])
+        self.assertNotIn('private', ' '.join(callout))
+
     def test_live_timestamp_reports_recency(self):
         shown = live_pipeline_timestamp(
             '2026-10-25T19:34:03+00:00',
@@ -169,6 +180,21 @@ class LivePipelineGuiTests(unittest.TestCase):
         )
         self.assertIn('(30s ago)', shown)
         self.assertEqual(live_pipeline_timestamp(None), 'No events received')
+
+    def test_sender_diagnostics_format_is_allowlisted(self):
+        shown = live_pipeline_sender_text({
+            'state': 'running', 'thread_alive': True, 'file_size': 1000,
+            'sender_offset': 800, 'reader_offset': 950, 'pending_bytes': 200,
+            'last_result': 'HTTP_200', 'heartbeat_age_seconds': 2.4,
+            'private_path': 'C:/private/WoWCombatLog.txt',
+            'access_token': 'do-not-show',
+        })
+
+        self.assertIn('Sender: running', shown)
+        self.assertIn('pending: 200 B', shown)
+        self.assertIn('heartbeat: 2s ago', shown)
+        self.assertNotIn('private', shown)
+        self.assertNotIn('do-not-show', shown)
 
 
 class GuiLearnerSelectionTests(unittest.TestCase):

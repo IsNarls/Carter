@@ -89,6 +89,8 @@ CARTER_ANALYSIS_LOG_CHANNEL_INGEST=true
 CARTER_ANALYSIS_MANAGE_BACKEND=true
 CARTER_ANALYSIS_STARTUP_TIMEOUT=15
 CARTER_ANALYSIS_HEALTH_INTERVAL=15
+CARTER_LIVE_ANNOUNCEMENT_MAX_AGE_SECONDS=15
+CARTER_LIVE_ANNOUNCEMENT_POLL_MS=100
 ```
 
 Voice and chat use separate Gemini models. `CARTER_GEMINI_MODEL` remains the
@@ -176,9 +178,51 @@ python log_backend/live_log_pipeline.py --log "/path/to/WoWCombatLog.txt" \
 The pipeline starts at the end of a new existing file by default, follows only
 complete lines, batches uploads, and saves a non-secret versioned byte cursor.
 It resumes the same logical stream after a restart and gives a replaced or
-truncated log a new stream identity, so byte offsets cannot collide. It refuses
+truncated file a new stream identity.
+
+For Windows-local mechanic detection, use the independent compact-event receiver
+instead of waiting behind bulk uploads. See
+[Carter Companion protocol](log_backend/COMPANION_PROTOCOL.md) for the strict
+schemas, authentication, retry rules, private source configuration and proxy
+deployment. Build the Windows profile bundle with
+`python -m log_backend.build_companion_bundle`; output is under
+`.carter_data/companion-distribution/`. Select `/logs live mode:on source:companion`
+and connect Carter with `/carter join`. The saved default is `raw_log`; only the
+selected source produces voice announcements, while bulk analysis remains available.
+The checked-in Windows handoff ZIP and checksum are also available under
+[`dist/companion/`](dist/companion/README.md). Private combat logs are not included.
+
+For temporary sender debugging, an authenticated client may send sanitized
+heartbeat counters on the existing `POST /api/v1/live/ingest` route, including
+sender state, thread health, byte offsets, pending bytes, and result codes. An
+empty heartbeat never advances the durable combat-log cursor. These counters
+are held in memory and shown only by the private loopback live-status API and
+the server GUI's **Live pipeline** tab. Raw log lines, access tokens, token
+headers, and full client paths are neither accepted nor displayed. This needs
+no additional public route or Nginx change; stop sending the optional debug
+headers to disable the telemetry. The sender refuses
 HTTP redirects rather than risk forwarding the token. Use `--from-start` only
 for an intentional initial historical pass.
+
+The optional heartbeat is an empty authenticated ingest request with the normal
+guild, token, stream-ID, and stream-offset headers. Safe debug headers are
+`X-Carter-Debug-State`, `X-Carter-Debug-Thread-Alive`,
+`X-Carter-Debug-File-Size`, `X-Carter-Debug-Reader-Offset`,
+`X-Carter-Debug-Pending-Bytes`, `X-Carter-Debug-Last-Attempt-Age-Ms`,
+`X-Carter-Debug-Last-Success-Age-Ms`, `X-Carter-Debug-Last-Result`, and
+`X-Carter-Debug-Client-Version`. Result and state values are short machine codes,
+not exception messages. The heartbeat should run from the GUI/controller thread
+independently of the upload worker so a dead worker can still be reported.
+
+For an end-to-end voice check, the authenticated Windows console may send an
+empty request with `X-Carter-Debug-Test-Announcement-ID` set to a fresh UUID4
+hex value (exactly 32 lowercase hexadecimal characters). Carter publishes a
+deduplicated private test event and, only when
+that guild has `/logs live mode:on` and Carter is already connected to its saved
+voice channel, speaks the fixed phrase “I have received the test prompt”. The
+client cannot supply speech text, the test never invokes AI, and it never joins
+voice automatically. The normal stream offset must agree before the test event
+is accepted.
 
 `--url` accepts either the HTTPS origin or its `/api/v1` base. Plain HTTP is
 accepted only for loopback unless `--allow-insecure` is explicitly used on an
@@ -212,7 +256,7 @@ Only IDs in `CARTER_ALLOWED_USER_IDS` may configure, activate, or control Carter
 - `/carter setlogs` stores this guild's selected logs channel and enables that channel as the source of report links.
 - `/carter join` joins the saved voice channel and arms local wake listening.
 - `/carter voicechannel` is the convenience command that accepts both channels, saves them, and connects; the caller must already be in the selected voice channel.
-- `/carter status` reports connection, selected channels, session state, and whether the wake listener is armed.
+- `/carter status` reports connection, selected channels, session state, whether the wake listener is armed, and whether live logging is enabled.
 - `/carter activate` explicitly starts one authorized request/response exchange.
 - `/carter stop` ends the current exchange while Carter remains in voice and rearms wake listening.
 - `/carter replay` replays Carter's latest generated voice response for up to ten minutes without contacting Gemini or consuming AI tokens. Only Carter's output is retained in memory; microphone audio is never stored, and the replay is cleared on leave or restart.
@@ -224,6 +268,7 @@ Selections are isolated by guild and survive Carter restarts. Carter still remai
 ### `/logs`
 
 - `/logs health` checks Carter's connection to the local analysis service.
+- `/logs live mode:on` enables this guild's live boss start/end voice announcements for the current Carter process; `mode:off` disables them and `mode:status` reports the state. This never connects Carter to voice, so use `/carter join` separately. Live logging defaults to off again after a restart.
 - `/logs reports` and `/logs fights` browse only this server's imported reports and encounters. The unfiltered fight list is ordered by each encounter's actual UTC timestamp, newest first, across all retained reports.
 - `/logs select` stores the guild's current report/fight context.
 - `/logs source` selects stored analysis or the current/an explicitly numbered archived live attempt.
@@ -238,6 +283,39 @@ Selections are isolated by guild and survive Carter restarts. Carter still remai
 - `/logs job` reports the status and outcome of an import job.
 
 Discord option descriptions are the source of truth for each command's required filters. Use `/logs reports` and `/logs fights` before selecting when a report, boss, difficulty, or player name is ambiguous.
+
+Live announcements use Carter's configured Gemini voice to speak only fixed or
+locally reviewed profile text. Carter polls the private, guild-scoped loopback
+update feed and never exposes that read API through the public reverse proxy.
+Unknown encounters retain the generic good-luck, good-job, and wipe messages.
+Known encounters can additionally emit observed mechanic callouts from validated
+`log_backend/callout_profiles/*.callout.json` files. The packaged catalog
+currently covers Nek'zali the Soulcoiler on difficulties 15 and 17, plus
+Entombed Sentinels on difficulty 15.
+Profile matching is exact by encounter ID and difficulty; raw DBM Lua is never
+loaded or executed.
+
+All profiles are indexed in memory, so zone-triggered preloading is unnecessary.
+The catalog checks for changes at each `ENCOUNTER_START`; a reviewed profile
+added while Carter is running is available on the next pull. Guild-specific
+profiles can be placed under
+`log_backend/data/guilds/GUILD_ID/callout-profiles/` and override a packaged
+profile with the same encounter and difficulty. See
+`log_backend/callout_profiles/README.md` for the bounded data contract.
+
+The default lifecycle freshness threshold is 15 seconds, measured from the
+combat-log event timestamp when Carter dispatches the announcement; set
+`CARTER_LIVE_ANNOUNCEMENT_MAX_AGE_SECONDS` from 1 through 300 if the sender's
+buffering requires a different bound. Tactical profile callouts use the stricter
+per-mechanic limit, currently five seconds, and are checked again after waiting
+for earlier speech. Archived imports and already-retained events are not replayed
+when live mode is enabled. A stale start is suppressed independently, so a fresh
+authoritative kill or wipe can still be announced. Polling defaults to 100
+milliseconds and can be set from 100 through 5000 with
+`CARTER_LIVE_ANNOUNCEMENT_POLL_MS`. Generated announcement audio is cached only
+in memory with bounded least-recently-used eviction. Repeated mechanic, kill,
+wipe, test, and boss phrases therefore skip a second provider connection; the
+cache is discarded when Carter restarts.
 
 ## Report ingestion and import jobs
 
@@ -318,6 +396,7 @@ Live Discord, provider, and Warcraft Logs checks were **not performed as part of
 - `/logs deaths` returns an ordered last-wipe timeline, and `/logs death` attaches a matching timestamped position diagram when the report supports one.
 - `/carter ask` answers a supported raid-log question in English with deterministic stored data and declines unsupported/ambiguous requests safely.
 - `/carter join` joins the saved channel and `/carter status` reports the wake listener armed.
+- `/logs live mode:on` enables only that guild, announces a fresh pull, matched reviewed mechanic callouts, and its authoritative kill or wipe once; an unknown encounter still receives the generic lifecycle phrases, and `/logs live mode:off` stops announcements without changing voice connectivity.
 - Ordinary speech, or speech that mentions “Carter” after other words, does not start Gemini or trigger analysis tools.
 - An utterance beginning with “Carter” starts one authorized Gemini Live exchange, and a log question invokes the local analysis tool successfully.
 - After Carter plays its first completed response, Gemini closes and the wake listener rearms; follow-up speech cannot produce another response without a new utterance beginning with “Carter”.

@@ -75,12 +75,28 @@ class MechanicTimelineTests(unittest.TestCase):
         self.assertEqual(engine.tick()[0]['mechanic_id'], 'warning')
         ended = engine.end(False, 1012)
         self.assertEqual(ended[-1]['result'], 'WIPE')
+        self.assertEqual(ended[-1]['effective_log_timestamp'], 1012)
+        self.assertEqual(ended[-1]['log_end_timestamp'], 1012)
         self.assertEqual(ended[-1]['trigger']['event_type'], 'ENCOUNTER_END')
         self.assertTrue(ended[-1]['trigger']['cancel_pending_mechanics'])
         self.assertEqual(ended[-2]['status'], 'CANCELED')
         second = TimelineEncounter('session', 'attempt-2', 2, 1, 'Boss', 15, 20, 2000)
         engine.start(second)
         self.assertEqual(engine.snapshot()['events'][0]['attempt_id'], 'attempt-2')
+
+    def test_delayed_processing_keeps_raw_end_timestamp_for_freshness(self):
+        clock = FakeClock()
+        engine = EncounterTimelineEngine(registry(), clock)
+        engine.start(TimelineEncounter(
+            'session', 'attempt-1', 1, 1, 'Boss', 15, 20, 1000,
+        ))
+        clock.advance(90)
+
+        ended = engine.end(True, 1005)[-1]
+
+        self.assertEqual(ended['elapsed_seconds'], 90)
+        self.assertEqual(ended['effective_log_timestamp'], 1005)
+        self.assertEqual(ended['log_end_timestamp'], 1005)
 
     def test_live_monitor_emits_structured_timeline(self):
         with tempfile.TemporaryDirectory(dir='.') as folder:

@@ -343,6 +343,10 @@ class EncounterTimelineEngine:
         ended = self._base('ENCOUNTER_ENDED', elapsed)
         ended.update({'status': 'ENDED', 'result': result,
                       'log_end_timestamp': log_timestamp,
+                      # Lifecycle freshness must use the authoritative combat-
+                      # log boundary, not processing_elapsed when ingestion is
+                      # catching up with a backlog.
+                      'effective_log_timestamp': log_timestamp,
                       'trigger': dict(self.script['encounter_triggers']['end'])})
         self.events.append(ended)
         emitted.append(ended)

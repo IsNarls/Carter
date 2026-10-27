@@ -18,18 +18,24 @@ import time
 if __package__:
     from .combat_log_core import decode_log_line, parse_event
     from .encounter_parser import analyze_encounter, scan_encounters, _timeline_from_dict, number
+    from .live_callouts import (CalloutProfileRegistry, DEFAULT_PROFILE_DIRECTORY,
+                                ObservedCalloutEngine)
     from .mechanic_timeline import (EncounterTimelineEngine, MechanicScriptRegistry,
                                     TimelineEncounter)
 else:  # Support direct execution from this directory.
     from combat_log_core import decode_log_line, parse_event
     from encounter_parser import analyze_encounter, scan_encounters, _timeline_from_dict, number
+    from live_callouts import (CalloutProfileRegistry, DEFAULT_PROFILE_DIRECTORY,
+                               ObservedCalloutEngine)
     from mechanic_timeline import (EncounterTimelineEngine, MechanicScriptRegistry,
                                    TimelineEncounter)
 
 
 LIVE_SCHEMA_VERSION = 3
 MAX_UPDATE_HISTORY = 5000
+MAX_LIFECYCLE_HISTORY = 200
 MAX_COMPLETED_ENCOUNTERS = 20
+MAX_FUTURE_CALLOUT_SECONDS = 2.0
 LIVE_ACCESS_TOKEN_FILENAME = '.live-access-token'
 LIVE_ACCESS_TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9_-]{40,128}$')
 REMOTE_INGEST_STATE_FILENAME = 'remote-ingest-state.json'
@@ -84,11 +90,12 @@ class LiveLogService:
 
     def __init__(self, source: Path | None, storage: Path, *, from_end=True,
                  poll_interval=0.2, rebuild_interval=0.5, mechanic_registry=None,
-                 timeline_clock=None, remote=False):
+                 timeline_clock=None, remote=False, callout_registry=None):
         self.source = Path(source).resolve() if source else None
         self.remote = bool(remote)
-        self.storage = Path(storage).resolve() / 'live-analysis'
-        token = ensure_live_access_token(storage)
+        storage_root = Path(storage).resolve()
+        self.storage = storage_root / 'live-analysis'
+        token = ensure_live_access_token(storage_root)
         self.access_token_path = token['path']
         self.access_token_fingerprint = token['fingerprint']
         self.from_end = bool(from_end)
@@ -97,6 +104,11 @@ class LiveLogService:
         source_key = str(self.source).casefold() if self.source else (
             f'remote:{Path(storage).resolve()}' if self.remote else 'unconfigured')
         self.session_id = hashlib.sha256(source_key.encode()).hexdigest()[:16]
+        # session_id intentionally identifies the configured source so persisted
+        # snapshots keep stable names.  feed_id identifies this in-memory
+        # producer generation so polling clients can safely detect a restart
+        # even when its cursor has already caught up to the old value.
+        self.feed_id = secrets.token_hex(16)
         self.source_name = self.source.name if self.source else (
             'remote WoWCombatLog.txt' if self.remote else None)
         self._lock = threading.RLock()
@@ -107,6 +119,10 @@ class LiveLogService:
         self._initialized = False
         self._cursor = 0
         self._updates = deque(maxlen=MAX_UPDATE_HISTORY)
+        # Preserve rare encounter transitions separately. A fast remote sender
+        # can upload more than MAX_UPDATE_HISTORY combat lines between Carter's
+        # polls; lifecycle events must remain observable across that churn.
+        self._lifecycle_updates = deque(maxlen=MAX_LIFECYCLE_HISTORY)
         self._state = 'idle' if source or self.remote else 'error'
         self._error_code = None if source or self.remote else 'LIVE_SOURCE_NOT_CONFIGURED'
         self._parse_errors = 0
@@ -122,9 +138,17 @@ class LiveLogService:
         self._archived = {}
         self.timeline_engine = EncounterTimelineEngine(
             mechanic_registry or MechanicScriptRegistry(), timeline_clock)
+        self.callout_engine = ObservedCalloutEngine(
+            callout_registry or CalloutProfileRegistry((
+                DEFAULT_PROFILE_DIRECTORY,
+                storage_root / 'callout-profiles',
+            )))
         self._restored_schedule = None
         self._last_start_signature = None
         self._remote_streams = self._load_remote_ingest_state() if self.remote else {}
+        self._sender_diagnostics = None
+        self._test_announcement_ids = set()
+        self._test_announcement_order = deque(maxlen=200)
         self._load_completed()
         if self.remote:
             self._recover_remote_spool()
@@ -155,7 +179,51 @@ class LiveLogService:
                                         separators=(',', ':')), encoding='utf-8')
         temporary.replace(destination)
 
-    def ingest_remote_batch(self, stream_id, offset, payload):
+    def _record_sender_diagnostics(self, diagnostics, offset, expected):
+        if not diagnostics:
+            return
+        safe = {
+            key: value for key, value in diagnostics.items()
+            if key in {
+                'state', 'thread_alive', 'file_size', 'reader_offset', 'pending_bytes',
+                'last_attempt_age_ms', 'last_success_age_ms', 'last_result',
+                'client_version',
+            }
+        }
+        safe.update({
+            'sender_offset': offset,
+            'server_expected_offset': offset if expected is None else expected,
+            'offset_matches': expected is None or expected == offset,
+            'received_at': datetime.now(timezone.utc).isoformat(),
+        })
+        self._sender_diagnostics = safe
+
+    def _emit_test_announcement(self, request_id):
+        if request_id in self._test_announcement_ids:
+            return False
+        if len(self._test_announcement_order) >= self._test_announcement_order.maxlen:
+            expired = self._test_announcement_order.popleft()
+            self._test_announcement_ids.discard(expired)
+        self._test_announcement_ids.add(request_id)
+        self._test_announcement_order.append(request_id)
+        now = datetime.now(timezone.utc)
+        self._cursor += 1
+        item = {
+            'cursor': self._cursor,
+            'type': 'ANNOUNCEMENT_TEST_REQUESTED',
+            'session_id': self.session_id,
+            'attempt_id': f'test-{request_id}',
+            'request_id': request_id,
+            'timestamp': now.isoformat(),
+            'received_at': now.isoformat(),
+            'event_age_seconds': 0.0,
+        }
+        self._updates.append(item)
+        self._lifecycle_updates.append(item.copy())
+        return True
+
+    def ingest_remote_batch(self, stream_id, offset, payload, diagnostics=None,
+                            test_announcement_id=None):
         """Ingest one complete-line byte batch and durably acknowledge its file offset."""
         if not self.remote:
             raise ValueError('Remote ingestion is not configured.')
@@ -166,10 +234,40 @@ class LiveLogService:
             offset = int(offset)
         except (TypeError, ValueError) as error:
             raise ValueError('The stream offset is invalid.') from error
-        if offset < 0 or not payload or not payload.endswith(b'\n'):
-            raise ValueError('A nonempty, complete-line payload is required.')
+        if offset < 0:
+            raise ValueError('The stream offset is invalid.')
+        if payload and not payload.endswith(b'\n'):
+            raise ValueError('Live log payloads must end with a complete line.')
+        test_announcement_id = str(test_announcement_id or '') or None
+        if test_announcement_id and not re.fullmatch(
+                r'[0-9a-f]{32}', test_announcement_id):
+            raise ValueError('The live announcement test identifier is invalid.')
+        if payload and test_announcement_id:
+            raise ValueError('A live announcement test request must have an empty body.')
+        if not payload and not diagnostics and not test_announcement_id:
+            raise ValueError('An empty live request must contain safe diagnostics or a test request.')
         with self._lock:
             expected = self._remote_streams.get(stream_id)
+            self._record_sender_diagnostics(diagnostics, offset, expected)
+            if not payload:
+                if expected is not None and offset != expected:
+                    return {
+                        'accepted': 0, 'next_offset': expected,
+                        'offset_mismatch': True, 'heartbeat': True,
+                    }
+                test_created = (self._emit_test_announcement(test_announcement_id)
+                                if test_announcement_id else False)
+                response = {
+                    'accepted': 0, 'next_offset': offset,
+                    'duplicate': False, 'heartbeat': True,
+                    'diagnostics_received': bool(diagnostics),
+                }
+                if test_announcement_id:
+                    response.update({
+                        'test_announcement_queued': test_created,
+                        'test_announcement_duplicate': not test_created,
+                    })
+                return response
             end = offset + len(payload)
             if expected is not None and end <= expected:
                 # Repair a state write that may have failed after the batch was
@@ -179,9 +277,39 @@ class LiveLogService:
             if expected is not None and offset != expected:
                 return {'accepted': 0, 'next_offset': expected, 'offset_mismatch': True}
             processed = 0
-            for raw in payload.splitlines(keepends=True):
-                self._process_line(raw)
-                processed += 1
+            spool_output = None
+            spool_path = None
+            try:
+                for raw in payload.splitlines(keepends=True):
+                    # Opening and closing the active spool once per combat event
+                    # cannot keep up with dense raid logs.  Reuse one buffered
+                    # append handle for ordinary lines, but close it around
+                    # encounter boundaries so start/end snapshot work always
+                    # sees every preceding byte and can rotate the spool safely.
+                    boundary = (b'ENCOUNTER_START' in raw
+                                or b'ENCOUNTER_END' in raw)
+                    active_spool = self._active_spool
+                    if boundary or active_spool != spool_path:
+                        if spool_output is not None:
+                            spool_output.close()
+                        spool_output = None
+                        spool_path = None
+                    if (not boundary and active_spool is not None
+                            and spool_output is None):
+                        spool_output = self._open_spool_append(active_spool)
+                        spool_path = active_spool
+                    self._process_line(raw, spool_output=spool_output)
+                    processed += 1
+            finally:
+                if spool_output is not None:
+                    spool_output.close()
+            # Do not synchronously re-analyze the growing spool for every
+            # remote batch. Raid backlogs can be hundreds of MiB, and a full
+            # rebuild here delays the acknowledgement long enough for the
+            # sender to time out and retry. ENCOUNTER_START creates the initial
+            # snapshot and the authoritative ENCOUNTER_END path performs the
+            # final rebuild/persistence; lifecycle updates are emitted while
+            # processing their individual lines.
             self._remote_streams[stream_id] = end
             # Retain only a small rotation history.
             if len(self._remote_streams) > 8:
@@ -210,6 +338,7 @@ class LiveLogService:
                     self._rebuild(force=True)
                     return
                 self._emit_timeline(self.timeline_engine.interrupt('monitor_stopped'))
+                self.callout_engine.reset()
                 self._state = 'abandoned'
                 self._persist_snapshot('abandoned')
 
@@ -249,6 +378,7 @@ class LiveLogService:
                     self._persist_snapshot('abandoned')
                 self._active_spool = self._active_ref = self._timeline = None
                 self._last_start_signature = None
+                self.callout_engine.reset()
                 self._state = 'idle'
             self._append_update('source_reset')
         processed = 0
@@ -288,9 +418,44 @@ class LiveLogService:
                 self._cursor += 1
                 item = dict(event)
                 item['cursor'] = self._cursor
+                received = datetime.now(timezone.utc)
+                item['received_at'] = received.isoformat()
+                event_epoch = (item.get('log_end_timestamp')
+                               if item.get('type') == 'ENCOUNTER_ENDED'
+                               else item.get('effective_log_timestamp'))
+                if isinstance(event_epoch, (int, float)):
+                    item['event_age_seconds'] = round(
+                        max(0.0, received.timestamp() - float(event_epoch)), 3)
                 self._updates.append(item)
+                if str(item.get('type') or '').startswith('ENCOUNTER_'):
+                    self._lifecycle_updates.append(item.copy())
 
-    def _process_line(self, raw):
+    def _emit_callouts(self, events):
+        """Publish bounded trusted speech events on the existing private update feed."""
+        with self._lock:
+            for event in events:
+                item = dict(event)
+                received = datetime.now(timezone.utc)
+                item['received_at'] = received.isoformat()
+                event_epoch = item.get('effective_log_timestamp')
+                if isinstance(event_epoch, (int, float)):
+                    raw_age = received.timestamp() - float(event_epoch)
+                    if raw_age < -MAX_FUTURE_CALLOUT_SECONDS:
+                        continue
+                    item['event_age_seconds'] = round(
+                        max(0.0, raw_age), 3)
+                self._cursor += 1
+                item['cursor'] = self._cursor
+                self._updates.append(item)
+                # Combat batches can evict thousands of ordinary updates before
+                # Carter polls. Preserve each sparse callout like lifecycle events.
+                self._lifecycle_updates.append(item.copy())
+
+    @staticmethod
+    def _open_spool_append(path):
+        return path.open('ab', buffering=1024 * 1024)
+
+    def _process_line(self, raw, *, spool_output=None):
         event = parse_event(decode_log_line(raw).rstrip('\r\n'))
         if event.kind == 'UNPARSED' or event.timestamp is None:
             with self._lock:
@@ -306,6 +471,7 @@ class LiveLogService:
                 if self._state == 'active':
                     self._emit_timeline(self.timeline_engine.interrupt(
                         'superseded_by_new_encounter'))
+                    self.callout_engine.reset()
                     self._state = 'abandoned'
                     self._persist_snapshot('abandoned')
                 self._attempt += 1
@@ -321,17 +487,28 @@ class LiveLogService:
                 self.session_id, f'{self.session_id}-{self._attempt:04d}', self._attempt,
                 number(event.fields[1]), event.fields[2], number(event.fields[3]),
                 number(event.fields[4]), event.timestamp)
-            self._emit_timeline(self.timeline_engine.start(timeline_encounter))
+            callout_profile = self.callout_engine.start(timeline_encounter)
+            timeline_events = self.timeline_engine.start(timeline_encounter)
+            if callout_profile:
+                for item in timeline_events:
+                    if item.get('type') == 'ENCOUNTER_STARTED':
+                        item['callout_profile_id'] = callout_profile['profile_id']
+                        item['callout_mechanic_count'] = len(callout_profile['mechanics'])
+            self._emit_timeline(timeline_events)
             self._rebuild()
             return
         if self._active_spool:
-            with self._active_spool.open('ab') as output:
-                output.write(raw)
+            if spool_output is None:
+                with self._open_spool_append(self._active_spool) as output:
+                    output.write(raw)
+            else:
+                spool_output.write(raw)
             self._dirty = True
             self._append_update('combat_event', event)
+            self._emit_callouts(self.callout_engine.process(event))
             if event.kind != 'ENCOUNTER_END':
                 self._emit_timeline(self.timeline_engine.tick(event.timestamp))
-            if event.kind == 'UNIT_DIED':
+            if event.kind == 'UNIT_DIED' and not self.remote:
                 self._rebuild(force=True)
             if event.kind == 'ENCOUNTER_END':
                 if (len(event.fields) < 6 or not self._active_ref or
@@ -339,6 +516,7 @@ class LiveLogService:
                     return
                 success = len(event.fields) >= 6 and event.fields[5] == '1'
                 self._emit_timeline(self.timeline_engine.end(success, event.timestamp))
+                self.callout_engine.end()
                 self._rebuild(force=True)
                 with self._lock:
                     self._state = 'completed'
@@ -459,6 +637,7 @@ class LiveLogService:
                 ref.encounter_id, ref.name, ref.difficulty, ref.group_size, ref.start,
             )
             self.timeline_engine.start(encounter)
+            self.callout_engine.start(encounter)
             self._last_event_epoch = ref.start
             with spool.open('rb') as source:
                 for raw in source:
@@ -471,18 +650,21 @@ class LiveLogService:
                     ).isoformat()
                     if event.kind not in {'ENCOUNTER_START', 'ENCOUNTER_END'}:
                         self.timeline_engine.tick(event.timestamp)
+                        self.callout_engine.process(event, suppress_emission=True)
 
             if ref.end is None:
                 self._state, self._error_code = 'active', None
                 return
 
             self.timeline_engine.end(ref.success, ref.end)
+            self.callout_engine.end()
             self._state, self._error_code = 'completed', None
             self._persist_snapshot('completed')
             self._completed.append(self._timeline)
             self._active_spool = None
             spool.unlink(missing_ok=True)
         except (OSError, ValueError, KeyError, TypeError):
+            self.callout_engine.reset()
             self._active_spool = None
             self._active_ref = None
 
@@ -532,10 +714,21 @@ class LiveLogService:
                 duration = self._timeline.encounter.duration
                 if duration is None and self._last_event_epoch is not None and self._active_ref:
                     duration = max(0.0, self._last_event_epoch - self._active_ref.start)
+            sender_diagnostics = (dict(self._sender_diagnostics)
+                                  if self._sender_diagnostics else None)
+            if sender_diagnostics:
+                try:
+                    received = datetime.fromisoformat(
+                        sender_diagnostics['received_at'].replace('Z', '+00:00'))
+                    sender_diagnostics['heartbeat_age_seconds'] = max(
+                        0.0, (datetime.now(timezone.utc) - received).total_seconds())
+                except (KeyError, TypeError, ValueError):
+                    sender_diagnostics['heartbeat_age_seconds'] = None
             return {
                 'schema_version': LIVE_SCHEMA_VERSION,
                 'source_type': 'remote_live_log' if self.remote else 'local_live_log',
-                'session_id': self.session_id, 'source_name': self.source_name,
+                'session_id': self.session_id, 'feed_id': self.feed_id,
+                'source_name': self.source_name,
                 'access_token_ready': True,
                 'access_token_fingerprint': self.access_token_fingerprint,
                 'configured': self.configured,
@@ -545,6 +738,8 @@ class LiveLogService:
                 'last_event_at': self._last_event_at, 'parse_errors': self._parse_errors,
                 'fight_time_seconds': duration, 'complete': self._state == 'completed',
                 'stale': bool(self._error_code), 'error_code': self._error_code,
+                'sender_diagnostics': sender_diagnostics,
+                'live_callouts': self.callout_engine.status(),
                 'mechanic_timeline': {
                     key: value for key, value in self.timeline_snapshot().items()
                     if key != 'events'
@@ -555,7 +750,15 @@ class LiveLogService:
     def updates(self, since=0, limit=100):
         with self._lock:
             history = list(self._updates)
+            oldest = history[0]['cursor'] if history else self._cursor + 1
+            protected = [item.copy() for item in self._lifecycle_updates
+                         if item['cursor'] > int(since) and item['cursor'] < oldest]
+            if protected:
+                # Deliver evicted lifecycle and guide-callout events before reporting the gap.
+                # The caller will advance past them, then receive CURSOR_EXPIRED
+                # and resume from the ordinary retained history.
+                return protected[:limit], protected[0]['cursor']
             if history and int(since) < history[0]['cursor'] - 1:
                 return None, history[0]['cursor']
             matches = [item.copy() for item in history if item['cursor'] > int(since)]
-            return matches[:limit], history[0]['cursor'] if history else self._cursor + 1
+            return matches[:limit], oldest

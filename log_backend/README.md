@@ -1,5 +1,12 @@
 # WoW Combat Log Viewer
 
+Windows-local encounter detection can now deliver compact events to
+`POST /api/v1/live/events`, independently of bulk-log processing. See
+[the companion protocol](COMPANION_PROTOCOL.md) for schemas, Windows bundle,
+source selection, lifecycle safety, telemetry and reverse-proxy deployment.
+Build the bundle from the project root with
+`python -m log_backend.build_companion_bundle`.
+
 A small Python desktop viewer for archived or actively written WoW combat logs.
 No third-party packages are required; Python with Tkinter is enough.
 
@@ -325,6 +332,38 @@ cursor returns `CURSOR_EXPIRED` with the oldest available cursor. Update results
 default to 100 and cap at 500. Live death replay defaults to the five seconds
 before death. Stored and live APIs share the ranking, death-context, replay, and
 mechanic limits documented above.
+
+### Observed live callout profiles
+
+The live backend preloads all reviewed `callout_profiles/*.callout.json` files
+and any guild-specific files under `data/guilds/GUILD_ID/callout-profiles/`.
+Selection is an exact in-memory lookup by the `ENCOUNTER_START` encounter ID and
+difficulty. The catalog is tiny, so `ZONE_CHANGE` and `MAP_CHANGE` do not trigger
+additional disk loading. Files are checked again when the next encounter starts,
+which lets a newly reviewed boss profile take effect without restarting Carter.
+
+Only observed combat-log triggers are supported. Each mechanic declares an exact
+event type, spell ID, constrained source policy, duplicate/grouping window,
+bounded spoken text, and maximum lateness. The backend emits a protected
+`MECHANIC_CALLOUT` update; it never exposes profile evidence, raw combat-log
+lines, or executable Lua. Carter drops late callouts both before queueing and
+again before playback. Unknown encounters or unmatched difficulties emit no
+mechanic callouts and continue using the generic voice lifecycle messages.
+
+The packaged profiles are:
+
+- Nek'zali the Soulcoiler, encounter 3470, difficulties 15 and 17
+- Entombed Sentinels, encounter 3445, difficulty 15
+
+Their wording remains provisional. Vashnik the Malignant and The Lost Explorers
+currently have only raw DBM evidence, so they intentionally use the unknown-boss
+fallback until reviewed JSON profiles are added. The unrelated
+`wow-guide-profile/v1` files remain offline timer-learning context and are not
+spoken at runtime.
+
+See `callout_profiles/README.md` and copy an existing profile when adding a boss.
+Invalid or conflicting files are skipped and listed under `live_callouts.errors`
+in `/api/v1/live/status`; valid profiles remain available.
 
 Live local logs usually do not identify a killing blow directly. The API marks
 the last correlated damage event as `inferred`, keeps it separate from the

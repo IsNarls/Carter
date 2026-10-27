@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from audio import PCMPlayback
-from providers import ProviderError, ProviderEvent
-from session import SessionLimits, VoiceSession
+from providers import ProviderError, ProviderEvent, ProviderSettings
+from session import FixedSpeechPlayer, SessionLimits, VoiceSession
 
 
 REAL_SLEEP = asyncio.sleep
@@ -28,6 +28,7 @@ class FakeProvider:
         self.connect_error = connect_error
         self.connects = self.closes = self.starts = self.ends = 0
         self.sent = []
+        self.sent_text = []
         self.tool_results = []
         self.events = asyncio.Queue()
 
@@ -38,6 +39,9 @@ class FakeProvider:
 
     async def send_audio(self, pcm):
         self.sent.append(pcm)
+
+    async def send_text(self, text):
+        self.sent_text.append(text)
 
     async def start_audio(self):
         self.starts += 1
@@ -120,6 +124,37 @@ class VoiceSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         for session in self.sessions:
             await session.stop()
+
+    async def test_fixed_speech_caches_exact_text_for_provider_free_replay(self):
+        provider = FakeProvider()
+        await provider.events.put(ProviderEvent("audio", b"\x01\x00" * 480))
+        await provider.events.put(ProviderEvent("turn_complete"))
+        voice = FakeVoice()
+        factory = FakeFactory(provider)
+        player = FixedSpeechPlayer(
+            ProviderSettings(gemini_key="not-used"), factory,
+        )
+
+        task = asyncio.create_task(player.speak(voice, "Good job!"))
+        await eventually(lambda: voice.source is not None and not voice.source.is_idle())
+        while not voice.source.is_idle():
+            voice.source.read()
+        await task
+
+        first_source = voice.source
+        task = asyncio.create_task(player.speak(voice, "Good job!"))
+        await eventually(
+            lambda: voice.source is not first_source and not voice.source.is_idle(),
+        )
+        while not voice.source.is_idle():
+            voice.source.read()
+        await task
+
+        self.assertEqual(provider.sent_text, ["Good job!"])
+        self.assertEqual(provider.connects, 1)
+        self.assertEqual(provider.closes, 1)
+        self.assertEqual(factory.names, ["gemini"])
+        self.assertFalse(voice.playing)
 
     async def notice(self, message):
         self.notices.append(message)

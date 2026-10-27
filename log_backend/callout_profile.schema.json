@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/schemas/carter-observed-callouts-v1.json",
+  "title": "Carter observed live callout profile",
+  "type": "object",
+  "required": [
+    "format", "schema_version", "profile_id", "encounter_id",
+    "encounter_name", "difficulty_ids", "boss_creature_ids",
+    "predictions_enabled", "mechanics"
+  ],
+  "properties": {
+    "format": {"const": "carter-observed-callouts/v1"},
+    "schema_version": {"const": 1},
+    "profile_revision": {"type": "integer", "minimum": 1, "maximum": 9007199254740991, "default": 1},
+    "profile_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,79}$"
+    },
+    "encounter_id": {"type": "integer", "minimum": 1},
+    "encounter_name": {"type": "string", "minLength": 1, "maxLength": 120},
+    "difficulty_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1}
+    },
+    "boss_creature_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 40,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1}
+    },
+    "predictions_enabled": {"const": false},
+    "mechanics": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "items": {"$ref": "#/$defs/mechanic"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "mechanic": {
+      "type": "object",
+      "required": [
+        "mechanic_id", "name", "event_type", "spell_id", "source_policy",
+        "grouping", "duplicate_suppression_seconds", "text", "audio_key",
+        "priority", "max_lateness_seconds", "confidence", "wording_status"
+      ],
+      "properties": {
+        "mechanic_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,79}$"
+        },
+        "name": {"type": "string", "minLength": 1, "maxLength": 120},
+        "event_type": {
+          "enum": [
+            "SPELL_AURA_APPLIED", "SPELL_AURA_REMOVED", "SPELL_CAST_START",
+            "SPELL_CAST_SUCCESS", "SPELL_SUMMON"
+          ]
+        },
+        "spell_id": {"type": "integer", "minimum": 1},
+        "source_policy": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["kind", "creature_ids"],
+              "properties": {
+                "kind": {"const": "creature_allowlist"},
+                "creature_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 40,
+                  "uniqueItems": true,
+                  "items": {"type": "integer", "minimum": 1}
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["kind", "guids"],
+              "properties": {
+                "kind": {"const": "nil_or_zero_guid"},
+                "guids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {"enum": ["nil", "0000000000000000"]}
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "grouping": {
+          "type": "object",
+          "required": ["mode", "window_seconds"],
+          "properties": {
+            "mode": {"const": "leading_edge_batch_window"},
+            "window_seconds": {"type": "number", "minimum": 0, "maximum": 300}
+          },
+          "additionalProperties": false
+        },
+        "duplicate_suppression_seconds": {
+          "type": "number", "minimum": 0, "maximum": 300
+        },
+        "text": {"type": "string", "minLength": 1, "maxLength": 240},
+        "audio_key": {"type": "string", "minLength": 1, "maxLength": 100},
+        "priority": {"type": "integer", "minimum": 0, "maximum": 100},
+        "max_lateness_seconds": {
+          "type": "number", "exclusiveMinimum": 0, "maximum": 300
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "wording_status": {"enum": ["verified", "provisional"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}

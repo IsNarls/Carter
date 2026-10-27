@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from urllib.parse import quote
 from urllib.error import HTTPError
@@ -13,14 +14,14 @@ from urllib.request import Request, urlopen
 if __package__:
     from .analysis_api import create_server
     from .analysis_service import AnalysisService, ServiceError
-    from .live_log_service import (LIVE_ACCESS_TOKEN_FILENAME, LiveLogService,
-                                   ensure_live_access_token)
+    from .live_log_service import (LIVE_ACCESS_TOKEN_FILENAME, MAX_UPDATE_HISTORY,
+                                   LiveLogService, ensure_live_access_token)
     from .mechanic_timeline import MechanicScriptRegistry
 else:
     from analysis_api import create_server
     from analysis_service import AnalysisService, ServiceError
-    from live_log_service import (LIVE_ACCESS_TOKEN_FILENAME, LiveLogService,
-                                  ensure_live_access_token)
+    from live_log_service import (LIVE_ACCESS_TOKEN_FILENAME, MAX_UPDATE_HISTORY,
+                                  LiveLogService, ensure_live_access_token)
     from mechanic_timeline import MechanicScriptRegistry
 
 
@@ -100,6 +101,19 @@ class LiveLogTests(unittest.TestCase):
             self.assertGreaterEqual(len(token_value), 40)
             if os.name == 'posix':
                 self.assertEqual(token_path.stat().st_mode & 0o077, 0)
+        finally:
+            recovered.stop()
+
+    def test_feed_generation_changes_across_restart_while_session_stays_stable(self):
+        first_status = self.service.get_live_status()
+        recovered = LiveLogService(self.log, self.root)
+        try:
+            recovered_service = AnalysisService(self.root, live=recovered)
+            second_status = recovered_service.get_live_status()
+            updates = recovered_service.get_live_updates(0)
+            self.assertEqual(first_status['session_id'], second_status['session_id'])
+            self.assertNotEqual(first_status['feed_id'], second_status['feed_id'])
+            self.assertEqual(updates['feed_id'], second_status['feed_id'])
         finally:
             recovered.stop()
 
@@ -186,6 +200,10 @@ class LiveLogTests(unittest.TestCase):
             thread.join()
         updates = self.service.get_live_updates(0, 2)
         self.assertEqual(len(updates['updates']), 2)
+        lifecycle = next(update for update in updates['updates']
+                         if update['type'] == 'ENCOUNTER_STARTED')
+        self.assertIn('received_at', lifecycle)
+        self.assertGreaterEqual(lifecycle['event_age_seconds'], 0)
         self.append(FUTURE_HIT + CAST_END + END)
         self.assertEqual(self.service.get_live_status()['encounter_state'], 'completed')
         completed_replay = self.service.get_live_death_replay(deaths[0]['death_id'])
@@ -344,6 +362,54 @@ class LiveLogTests(unittest.TestCase):
         self.assertEqual(self.live.status()['encounter_state'], 'active')
         self.assertEqual(self.service.get_live_encounter()['attempt'], 2)
 
+    def test_lifecycle_updates_survive_combat_update_churn(self):
+        self.append(START)
+        started = next(item for item in self.live.updates(0, 100)[0]
+                       if item['type'] == 'ENCOUNTER_STARTED')
+        for _index in range(MAX_UPDATE_HISTORY + 10):
+            self.live._append_update('combat_event')
+
+        protected, _oldest = self.live.updates(0, 100)
+        self.assertEqual(
+            [(item['cursor'], item['type']) for item in protected],
+            [(started['cursor'], 'ENCOUNTER_STARTED')],
+        )
+        expired, oldest = self.live.updates(started['cursor'], 100)
+        self.assertIsNone(expired)
+        self.assertGreater(oldest, started['cursor'])
+
+    def test_remote_batch_only_builds_the_initial_active_snapshot(self):
+        remote = LiveLogService(
+            None, self.root / 'remote-rebuild', remote=True, rebuild_interval=.5,
+        )
+        try:
+            with patch.object(remote, '_rebuild', wraps=remote._rebuild) as rebuild:
+                remote.ingest_remote_batch(
+                    'remote-stream-001', 0, (START + DEATH * 20).encode(),
+                )
+            self.assertEqual(rebuild.call_count, 1)
+            self.assertEqual(remote.status()['encounter_state'], 'active')
+        finally:
+            remote.stop()
+
+    def test_remote_batch_reuses_one_spool_handle_for_dense_combat_lines(self):
+        remote = LiveLogService(None, self.root / 'remote-spool', remote=True)
+        dense = BOSS_HIT * 100
+        try:
+            with patch.object(
+                    remote, '_open_spool_append', wraps=remote._open_spool_append) as opened:
+                result = remote.ingest_remote_batch(
+                    'remote-stream-spool', 0, (START + dense + END).encode(),
+                )
+
+            self.assertEqual(result['accepted'], 102)
+            # One shared handle for the dense body and one boundary write for
+            # ENCOUNTER_END. ENCOUNTER_START creates the spool atomically.
+            self.assertEqual(opened.call_count, 2)
+            self.assertEqual(remote.status()['encounter_state'], 'completed')
+        finally:
+            remote.stop()
+
     def test_unconfigured_and_expired_cursor_errors(self):
         with self.assertRaises(ServiceError) as raised:
             AnalysisService(self.root).get_live_updates()
@@ -369,6 +435,14 @@ class LiveLogTests(unittest.TestCase):
                 urlopen(guild_request(url, data=START.encode(), method='POST', headers=headers))
             self.assertEqual(raised.exception.code, 401)
 
+            unauthenticated_test = dict(headers)
+            unauthenticated_test['X-Carter-Debug-Test-Announcement-ID'] = 'a' * 32
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(guild_request(
+                    url, data=b'', method='POST', headers=unauthenticated_test,
+                ))
+            self.assertEqual(raised.exception.code, 401)
+
             guild_storage = self.root / 'guilds' / GUILD_ID
             self.assertFalse(guild_storage.exists())
             token_path = ensure_live_access_token(guild_storage)['path']
@@ -390,6 +464,98 @@ class LiveLogTests(unittest.TestCase):
             self.assertEqual(status['source_type'], 'remote_live_log')
             self.assertEqual(status['encounter_state'], 'completed')
             self.assertNotIn(token, json.dumps(status))
+
+            heartbeat_headers = dict(headers)
+            heartbeat_headers['X-Carter-Live-Offset'] = str(len(data))
+            heartbeat_headers.update({
+                'X-Carter-Debug-State': 'running',
+                'X-Carter-Debug-Thread-Alive': 'true',
+                'X-Carter-Debug-File-Size': str(len(data) + 250),
+                'X-Carter-Debug-Reader-Offset': str(len(data) + 100),
+                'X-Carter-Debug-Pending-Bytes': '250',
+                'X-Carter-Debug-Last-Result': 'HTTP_200',
+                'X-Carter-Debug-Client-Version': 'live-console-1.1',
+            })
+            with urlopen(guild_request(
+                    url, data=b'', method='POST', headers=heartbeat_headers)) as response:
+                heartbeat = json.load(response)
+            self.assertTrue(heartbeat['heartbeat'])
+            self.assertTrue(heartbeat['diagnostics_received'])
+            self.assertNotIn('test_announcement_queued', heartbeat)
+            self.assertNotIn('test_announcement_duplicate', heartbeat)
+
+            with urlopen(guild_request(status_url)) as response:
+                diagnosed = json.load(response)['sender_diagnostics']
+            self.assertEqual(diagnosed['state'], 'running')
+            self.assertTrue(diagnosed['thread_alive'])
+            self.assertEqual(diagnosed['sender_offset'], len(data))
+            self.assertEqual(diagnosed['pending_bytes'], 250)
+            self.assertTrue(diagnosed['offset_matches'])
+            self.assertIn('received_at', diagnosed)
+            self.assertGreaterEqual(diagnosed['heartbeat_age_seconds'], 0)
+            self.assertNotIn('path', json.dumps(diagnosed).casefold())
+
+            for invalid_id in ('a' * 31, 'A' * 32, ('a' * 31) + '-', 'test-request-001'):
+                invalid_headers = dict(heartbeat_headers)
+                invalid_headers['X-Carter-Debug-Test-Announcement-ID'] = invalid_id
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(guild_request(
+                        url, data=b'', method='POST', headers=invalid_headers,
+                    ))
+                self.assertEqual(raised.exception.code, 400)
+                invalid_response = json.load(raised.exception)
+                self.assertEqual(
+                    invalid_response['error']['code'], 'INVALID_LIVE_TEST_REQUEST',
+                )
+
+            before_test_cursor = status['cursor']
+            test_headers = dict(heartbeat_headers)
+            test_headers['X-Carter-Debug-Test-Announcement-ID'] = 'a' * 32
+            test_headers['X-Carter-Debug-Test-Speech'] = 'client text must be ignored'
+            with urlopen(guild_request(
+                    url, data=b'', method='POST', headers=test_headers)) as response:
+                test_request = json.load(response)
+            self.assertTrue(test_request['test_announcement_queued'])
+            self.assertEqual(test_request['next_offset'], len(data))
+
+            updates_url = (f'http://127.0.0.1:{server.server_port}/api/v1/live/updates'
+                           f'?since={before_test_cursor}&limit=10')
+            with urlopen(guild_request(updates_url)) as response:
+                test_updates = json.load(response)['updates']
+            requested = [item for item in test_updates
+                         if item['type'] == 'ANNOUNCEMENT_TEST_REQUESTED']
+            self.assertEqual(len(requested), 1)
+            self.assertEqual(requested[0]['request_id'], 'a' * 32)
+            self.assertNotIn('text', requested[0])
+            self.assertNotIn('speech', json.dumps(requested[0]).casefold())
+
+            with urlopen(guild_request(
+                    url, data=b'', method='POST', headers=test_headers)) as response:
+                duplicate_test = json.load(response)
+            self.assertTrue(duplicate_test['test_announcement_duplicate'])
+            with urlopen(guild_request(status_url)) as response:
+                after_duplicate = json.load(response)
+            self.assertEqual(after_duplicate['cursor'], before_test_cursor + 1)
+
+            mismatch_headers = dict(heartbeat_headers)
+            mismatch_headers['X-Carter-Live-Offset'] = str(len(data) + 1)
+            mismatch_headers['X-Carter-Debug-Test-Announcement-ID'] = 'b' * 32
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(guild_request(
+                    url, data=b'', method='POST', headers=mismatch_headers,
+                ))
+            self.assertEqual(raised.exception.code, 409)
+            mismatch = json.load(raised.exception)
+            self.assertTrue(mismatch['offset_mismatch'])
+            self.assertNotIn('test_announcement_queued', mismatch)
+
+            with urlopen(guild_request(
+                    url, data=b'', method='POST', headers=heartbeat_headers)) as response:
+                unchanged_offset = json.load(response)
+            self.assertEqual(unchanged_offset['next_offset'], len(data))
+            with urlopen(guild_request(status_url)) as response:
+                after_mismatch = json.load(response)
+            self.assertEqual(after_mismatch['cursor'], before_test_cursor + 1)
         finally:
             server.shutdown()
             server.server_close()

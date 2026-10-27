@@ -177,7 +177,8 @@ def live_pipeline_update_row(update):
         shown_time = ''
     kind = str(update.get('type') or update.get('event_type') or 'update')[:80]
     detail_parts = []
-    for key in ('ability', 'source', 'target', 'status'):
+    for key in ('encounter_name', 'mechanic_id', 'message',
+                'ability', 'source', 'target', 'status'):
         value = update.get(key)
         if value not in (None, ''):
             detail_parts.append(str(value).replace('\r', ' ').replace('\n', ' ')[:100])
@@ -198,6 +199,31 @@ def live_pipeline_completed_row(encounter):
         duration_text,
         str(encounter.get('deaths') if isinstance(encounter.get('deaths'), int) else '—'),
     )
+
+
+def live_pipeline_sender_text(diagnostics):
+    """Format only the allowlisted, non-secret sender telemetry fields."""
+    if not isinstance(diagnostics, dict):
+        return 'Sender diagnostics: waiting for an authenticated heartbeat.'
+    state = str(diagnostics.get('state') or 'unknown')[:32]
+    alive = diagnostics.get('thread_alive')
+    alive_text = 'yes' if alive is True else 'no' if alive is False else 'unknown'
+    fields = [f'Sender: {state}', f'thread alive: {alive_text}']
+    for key, label in (
+            ('file_size', 'file'), ('sender_offset', 'offset'),
+            ('reader_offset', 'reader'), ('pending_bytes', 'pending')):
+        value = diagnostics.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            fields.append(f'{label}: {value:,} B')
+    result = diagnostics.get('last_result')
+    if result:
+        fields.append(f'last result: {str(result)[:64]}')
+    age = diagnostics.get('heartbeat_age_seconds')
+    if isinstance(age, (int, float)) and not isinstance(age, bool):
+        fields.append(f'heartbeat: {max(0, int(age))}s ago')
+    if diagnostics.get('offset_matches') is False:
+        fields.append('offset mismatch')
+    return ' · '.join(fields)
 
 
 _CONSOLE_SECRET_PATTERNS = (
@@ -2331,6 +2357,8 @@ class Launcher:
         self.live_pipeline_state = tk.StringVar(value='Encounter state: waiting')
         self.live_pipeline_event = tk.StringVar(value='Last event: waiting')
         self.live_pipeline_parse = tk.StringVar(value='Parse errors: waiting')
+        self.live_pipeline_sender = tk.StringVar(
+            value='Sender diagnostics: waiting for an authenticated heartbeat.')
         self.live_pipeline_encounter = tk.StringVar(value='No active encounter.')
         self.console_status = tk.StringVar(value='Console tail starting...')
         self.console_paths = {
@@ -2488,6 +2516,9 @@ class Launcher:
             row=1, column=0, sticky='w', pady=(7, 0))
         ttk.Label(summary, textvariable=self.live_pipeline_parse).grid(
             row=1, column=1, sticky='w', padx=(20, 0), pady=(7, 0))
+        ttk.Label(
+            summary, textvariable=self.live_pipeline_sender, wraplength=1020,
+        ).grid(row=2, column=0, columnspan=2, sticky='w', pady=(7, 0))
 
         encounter = ttk.LabelFrame(parent, text='Current encounter', padding=10)
         encounter.pack(fill='x', pady=(10, 0))
@@ -2873,8 +2904,17 @@ class Launcher:
         duration_text = (f' · fight time: {float(duration):.1f}s'
                          if isinstance(duration, (int, float)) else '')
         stale_text = ' · stale' if status.get('stale') else ''
+        callouts = status.get('live_callouts')
+        guide_text = ''
+        if isinstance(callouts, dict):
+            loaded = callouts.get('loaded_profiles')
+            active = callouts.get('active_profile_id')
+            if isinstance(loaded, int):
+                guide_text = f' · guides: {loaded}'
+            if active:
+                guide_text += f' · active guide: {str(active)[:80]}'
         self.live_pipeline_state.set(
-            f'Encounter state: {encounter_state}{duration_text}{stale_text}')
+            f'Encounter state: {encounter_state}{duration_text}{stale_text}{guide_text}')
         self.live_pipeline_event.set(
             f'Last event: {live_pipeline_timestamp(status.get("last_event_at"))}')
 
@@ -2887,6 +2927,8 @@ class Launcher:
         else:
             parse_text = 'Parse errors: unavailable'
         self.live_pipeline_parse.set(parse_text)
+        self.live_pipeline_sender.set(
+            live_pipeline_sender_text(status.get('sender_diagnostics')))
 
         encounter = snapshot.get('encounter')
         if encounter_state == 'active' and isinstance(encounter, dict):

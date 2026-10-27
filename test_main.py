@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from analysis_client import AnalysisClientError, AnalysisClientSettings, AnalysisImage
 from main import (
     Carter, CarterVoiceClient, ai_configuration, analysis_backend_configuration,
-    analysis_configuration,
+    analysis_configuration, live_announcement_configuration,
     wake_configuration, _format_job, _message_report_urls,
 )
 from raid_integration import RaidAnswer
@@ -56,6 +56,20 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict("os.environ", {"CARTER_ANALYSIS_MANAGE_BACKEND": "false"}, clear=True):
             managed, _, _ = analysis_backend_configuration(settings)
         self.assertFalse(managed)
+
+    def test_live_announcement_defaults_and_bounds(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(live_announcement_configuration(), (15, 0.1))
+        with patch.dict("os.environ", {
+            "CARTER_LIVE_ANNOUNCEMENT_MAX_AGE_SECONDS": "30",
+            "CARTER_LIVE_ANNOUNCEMENT_POLL_MS": "250",
+        }, clear=True):
+            self.assertEqual(live_announcement_configuration(), (30, 0.25))
+        with patch.dict("os.environ", {
+            "CARTER_LIVE_ANNOUNCEMENT_MAX_AGE_SECONDS": "0",
+        }, clear=True):
+            with self.assertRaises(ValueError):
+                live_announcement_configuration()
 
     def test_invalid_provider_fallback_and_limits_are_rejected(self):
         for setting in ({"CARTER_AI_PROVIDER": "openai"},
@@ -180,7 +194,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {command.name for command in logs.commands},
             {"health", "reports", "fights", "select", "source", "summary", "ranking",
-             "player", "death", "deaths", "identity", "ingest", "import", "job", "reset"},
+             "player", "death", "deaths", "identity", "ingest", "import", "job", "reset",
+             "live"},
         )
 
     async def test_logs_reset_requires_admin_and_explicit_confirmation(self):

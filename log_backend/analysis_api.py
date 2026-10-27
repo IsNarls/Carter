@@ -17,17 +17,36 @@ if __package__:
     from .import_jobs import ImportJobError, ReportImportJobManager
     from .live_log_service import (LIVE_ACCESS_TOKEN_FILENAME,
                                    LIVE_ACCESS_TOKEN_PATTERN, LiveLogService)
+    from .companion_events import CompanionEvents, MAX_REQUEST_BYTES
 else:  # Support ``python analysis_api.py`` from this directory.
     from analysis_service import AnalysisService, ServiceError, API_SCHEMA_VERSION
     from import_jobs import ImportJobError, ReportImportJobManager
     from live_log_service import (LIVE_ACCESS_TOKEN_FILENAME,
                                   LIVE_ACCESS_TOKEN_PATTERN, LiveLogService)
+    from companion_events import CompanionEvents, MAX_REQUEST_BYTES
 
 
 GUILD_ID = re.compile(r'^[1-9][0-9]{0,19}$')
 GUILD_HEADER = 'X-Carter-Guild-ID'
 LIVE_TOKEN_HEADER = 'X-Carter-Live-Token'
+LIVE_TEST_ANNOUNCEMENT_HEADER = 'X-Carter-Debug-Test-Announcement-ID'
 MAX_LIVE_BATCH_BYTES = 512 * 1024
+LIVE_DIAGNOSTIC_TEXT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$')
+LIVE_DIAGNOSTIC_HEADERS = {
+    'state': 'X-Carter-Debug-State',
+    'thread_alive': 'X-Carter-Debug-Thread-Alive',
+    'file_size': 'X-Carter-Debug-File-Size',
+    'reader_offset': 'X-Carter-Debug-Reader-Offset',
+    'pending_bytes': 'X-Carter-Debug-Pending-Bytes',
+    'last_attempt_age_ms': 'X-Carter-Debug-Last-Attempt-Age-Ms',
+    'last_success_age_ms': 'X-Carter-Debug-Last-Success-Age-Ms',
+    'last_result': 'X-Carter-Debug-Last-Result',
+    'client_version': 'X-Carter-Debug-Client-Version',
+}
+LIVE_DIAGNOSTIC_NUMBERS = {
+    'file_size', 'reader_offset', 'pending_bytes',
+    'last_attempt_age_ms', 'last_success_age_ms',
+}
 
 
 def guild_storage_directory(storage, guild_id):
@@ -58,6 +77,15 @@ class GuildAnalysisRegistry:
         self._owned_jobs = set()
         self._owned_live = set()
         self._lock = threading.Lock()
+        self._companions = {}
+        self._companion_lock = threading.Lock()
+
+    def companion(self, guild_id):
+        directory = guild_storage_directory(self.storage, guild_id)
+        with self._companion_lock:
+            if str(guild_id) not in self._companions:
+                self._companions[str(guild_id)] = CompanionEvents(directory)
+            return self._companions[str(guild_id)]
 
     def authenticate_live_ingest(self, guild_id, supplied):
         """Authenticate without provisioning attacker-selected guild storage."""
@@ -162,10 +190,131 @@ class AnalysisRequestHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError) as error:
             raise ServiceError('INVALID_CONTENT_LENGTH',
                                'Content-Length must be a nonnegative integer.') from error
-        if length < 1 or length > MAX_LIVE_BATCH_BYTES:
+        if length < 0 or length > MAX_LIVE_BATCH_BYTES:
             raise ServiceError('REQUEST_TOO_LARGE',
-                               'Live batches must be between 1 byte and 512 KiB.', 413)
+                               'Live batches must be no larger than 512 KiB.', 413)
         return self.rfile.read(length)
+
+    def _companion_body(self):
+        if self.headers.get_content_type() != 'application/json':
+            raise ServiceError('INVALID_CONTENT_TYPE', 'Use application/json.', 415)
+        if self.headers.get('Transfer-Encoding'):
+            raise ServiceError('INVALID_CONTENT_LENGTH', 'Use Content-Length.')
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            raise ServiceError('INVALID_CONTENT_LENGTH', 'Content-Length must be an integer.') from None
+        if not 0 < length <= MAX_REQUEST_BYTES:
+            raise ServiceError('REQUEST_TOO_LARGE', 'Event requests must contain 1 through 65536 bytes.', 413)
+        try:
+            # Reject duplicate JSON keys and non-JSON NaN/Infinity values.
+            def pairs(items):
+                result = {}
+                for key, value in items:
+                    if key in result:
+                        raise ValueError('Duplicate JSON field.')
+                    result[key] = value
+                return result
+            def constant(_):
+                raise ValueError('Invalid JSON number.')
+            return json.loads(self.rfile.read(length), object_pairs_hook=pairs, parse_constant=constant)
+        except (ValueError, UnicodeError):
+            raise ServiceError('INVALID_JSON', 'Event body must be strict JSON.') from None
+
+    def _companion_route(self, method, path, query, guild_id):
+        """Bypass the analysis registry/ingest lock entirely for compact traffic."""
+        companion = self.registry.companion(guild_id)
+        if path == '/api/v1/live/events' and method == 'POST':
+            try:
+                return companion.receive(self._companion_body())
+            except ValueError as error:
+                raise ServiceError('INVALID_LIVE_EVENTS', str(error)) from error
+        if path == '/api/v1/live/announcement-source':
+            if method == 'POST':
+                body = self._companion_body()
+                if not isinstance(body, dict) or set(body) != {'source'}:
+                    raise ServiceError('INVALID_PARAMETER', 'Expected only source.')
+                try:
+                    return companion.set_source(body['source'])
+                except ValueError as error:
+                    raise ServiceError('INVALID_PARAMETER', str(error)) from error
+            if method == 'GET':
+                return companion.status()
+        if method == 'GET' and path in ('/api/v1/live/announcements', '/api/v1/live/announcements/status'):
+            selected = companion.status()
+            if selected['announcement_source'] == 'raw_log':
+                service, _ = self.registry.scope(guild_id)
+                result = (service.get_live_status() if path.endswith('/status') else
+                          service.get_live_updates(self._value(query, 'since', 0, int),
+                                                   self._value(query, 'limit', 100, int)))
+                # Never hold the compact-event lock while waiting on bulk analysis.
+                current = companion.status()
+                if current['feed_id'] != selected['feed_id']:
+                    return {**current, 'updates': [], 'truncated': False}
+                return {**result, 'announcement_source': 'raw_log',
+                        'feed_id': selected['feed_id'] + ':' + str(result.get('feed_id', ''))}
+            with companion.lock:
+                selected = companion.status()
+                if selected['announcement_source'] != 'companion':
+                    return {**selected, 'updates': [], 'truncated': False}
+                if path.endswith('/status'):
+                    return selected
+                since = self._value(query, 'since', 0, int)
+                limit = min(500, max(1, self._value(query, 'limit', 100, int)))
+                updates, oldest = companion.updates(since, limit)
+                if updates is None:
+                    raise ServiceError('CURSOR_EXPIRED', 'Cursor no longer retained.', 409,
+                                       oldest_cursor=oldest)
+                return {**selected, 'updates': updates, 'truncated': len(updates) == limit,
+                        'limit': limit, 'since_cursor': since}
+        raise ServiceError('ENDPOINT_NOT_FOUND', 'The requested endpoint does not exist.', 404)
+
+    def _live_sender_diagnostics(self):
+        """Read a small allowlist of non-secret sender counters from request headers."""
+        result = {}
+        for name, header in LIVE_DIAGNOSTIC_HEADERS.items():
+            raw = self.headers.get(header)
+            if raw is None:
+                continue
+            value = str(raw).strip()
+            if name in LIVE_DIAGNOSTIC_NUMBERS:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError) as error:
+                    raise ServiceError(
+                        'INVALID_LIVE_DIAGNOSTIC', f'{header} must be a nonnegative integer.',
+                    ) from error
+                if number < 0 or number > (2 ** 63 - 1):
+                    raise ServiceError(
+                        'INVALID_LIVE_DIAGNOSTIC', f'{header} is outside the allowed range.',
+                    )
+                result[name] = number
+            elif name == 'thread_alive':
+                normalized = value.casefold()
+                if normalized not in {'true', 'false'}:
+                    raise ServiceError(
+                        'INVALID_LIVE_DIAGNOSTIC', f'{header} must be true or false.',
+                    )
+                result[name] = normalized == 'true'
+            else:
+                if not LIVE_DIAGNOSTIC_TEXT.fullmatch(value):
+                    raise ServiceError(
+                        'INVALID_LIVE_DIAGNOSTIC', f'{header} contains an invalid value.',
+                    )
+                result[name] = value
+        return result
+
+    def _live_test_announcement_id(self):
+        value = self.headers.get(LIVE_TEST_ANNOUNCEMENT_HEADER)
+        if value is None:
+            return None
+        value = str(value).strip()
+        if not re.fullmatch(r'[0-9a-f]{32}', value):
+            raise ServiceError(
+                'INVALID_LIVE_TEST_REQUEST',
+                f'{LIVE_TEST_ANNOUNCEMENT_HEADER} contains an invalid value.',
+            )
+        return value
 
     def _dispatch_get(self, path, query):
         if path == '/api/v1/health':
@@ -355,7 +504,9 @@ class AnalysisRequestHandler(BaseHTTPRequestHandler):
             offset = self.headers.get('X-Carter-Live-Offset')
             try:
                 result = self.service.live.ingest_remote_batch(
-                    stream_id, offset, self._live_body())
+                    stream_id, offset, self._live_body(),
+                    diagnostics=self._live_sender_diagnostics(),
+                    test_announcement_id=self._live_test_announcement_id())
             except ValueError as error:
                 raise ServiceError('INVALID_LIVE_BATCH', str(error)) from error
             if result.get('offset_mismatch'):
@@ -396,10 +547,16 @@ class AnalysisRequestHandler(BaseHTTPRequestHandler):
         try:
             if request.path != '/api/v1/health':
                 guild_id = self.headers.get(GUILD_HEADER)
-                if request.path == '/api/v1/live/ingest':
+                if request.path in ('/api/v1/live/ingest', '/api/v1/live/events'):
                     self.registry.authenticate_live_ingest(
                         guild_id, self.headers.get(LIVE_TOKEN_HEADER),
                     )
+                if request.path in ('/api/v1/live/events', '/api/v1/live/announcement-source',
+                                    '/api/v1/live/announcements', '/api/v1/live/announcements/status'):
+                    result = self._companion_route(method, request.path,
+                                                   parse_qs(request.query), guild_id)
+                    self._send(200, result)
+                    return
                 self.service, self.import_jobs = self.registry.scope(
                     guild_id,
                     require_jobs=request.path == '/api/v1/imports'

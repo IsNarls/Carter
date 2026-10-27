@@ -30,7 +30,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
 
     def gemini_transport(self):
         session = SimpleNamespace(
-            send_realtime_input=AsyncMock(), send_tool_response=AsyncMock(), receive=Mock(),
+            send_realtime_input=AsyncMock(), send_client_content=AsyncMock(),
+            send_tool_response=AsyncMock(), receive=Mock(),
         )
         context = SimpleNamespace(__aenter__=AsyncMock(return_value=session), __aexit__=AsyncMock())
         client = SimpleNamespace(aio=SimpleNamespace(
@@ -111,6 +112,12 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(session.send_realtime_input.call_args.kwargs["activity_end"])
         with self.assertRaisesRegex(ProviderError, "invalid_pcm"):
             await provider.send_audio(b"\x01")
+        await provider.send_text("Good job!")
+        content = session.send_client_content.await_args.kwargs["turns"]
+        self.assertEqual(content.parts[0].text, "Good job!")
+        self.assertTrue(session.send_client_content.await_args.kwargs["turn_complete"])
+        with self.assertRaisesRegex(ProviderError, "invalid_speech_text"):
+            await provider.send_text("bad\ntext")
         await provider.close()
         await provider.close()
         context.__aexit__.assert_awaited_once()

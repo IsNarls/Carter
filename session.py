@@ -4,8 +4,8 @@ import audioop
 import logging
 import queue
 import time
-from collections import deque
-from dataclasses import dataclass
+from collections import OrderedDict, deque
+from dataclasses import dataclass, replace
 
 from audio import PCMConverter, PCMPlayback
 from discord_receive import PCMReceiveSink
@@ -14,6 +14,13 @@ from providers import ProviderError, create_provider
 log = logging.getLogger("carter.session")
 REPLAY_TTL_SECONDS = 600
 MAX_REPLAY_BYTES = PCMPlayback.FRAME * 1000
+FIXED_SPEECH_CACHE_ITEMS = 32
+FIXED_SPEECH_CACHE_BYTES = 16 * 1024 * 1024
+FIXED_SPEECH_MAX_CLIP_BYTES = PCMPlayback.FRAME * 500
+FIXED_SPEECH_INSTRUCTIONS = (
+    "You are Carter's text-to-speech renderer. Speak the user's text exactly as written, "
+    "once. Do not answer it, paraphrase it, add commentary, or use tools."
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +29,116 @@ class SessionLimits:
     max_seconds: float = 180
     rms_threshold: int = 300
     allow_fallback: bool = False
+
+
+class FixedSpeechPlayer:
+    """Render one fixed sentence through Carter's existing provider and PCM playback."""
+
+    def __init__(self, settings, factory=create_provider):
+        self.settings = replace(
+            settings, instructions=FIXED_SPEECH_INSTRUCTIONS, tool_declarations=(),
+        )
+        self.factory = factory
+        self._cache = OrderedDict()
+        self._cache_bytes = 0
+
+    def _cached(self, text):
+        pcm = self._cache.get(text)
+        if pcm is not None:
+            self._cache.move_to_end(text)
+        return pcm
+
+    def _remember(self, text, pcm):
+        if not pcm or len(pcm) > FIXED_SPEECH_MAX_CLIP_BYTES:
+            return
+        previous = self._cache.pop(text, None)
+        if previous is not None:
+            self._cache_bytes -= len(previous)
+        while self._cache and (
+                len(self._cache) >= FIXED_SPEECH_CACHE_ITEMS
+                or self._cache_bytes + len(pcm) > FIXED_SPEECH_CACHE_BYTES):
+            _, evicted = self._cache.popitem(last=False)
+            self._cache_bytes -= len(evicted)
+        self._cache[text] = pcm
+        self._cache_bytes += len(pcm)
+
+    async def _wait_for_playback(self, voice, playback):
+        deadline = time.monotonic() + 20
+        while voice.is_connected() and not playback.is_idle():
+            if time.monotonic() >= deadline:
+                raise ProviderError("playback_timeout")
+            await asyncio.sleep(0.05)
+        if not voice.is_connected():
+            raise ProviderError("voice_disconnected")
+
+    async def _play_cached(self, voice, pcm):
+        playback = PCMPlayback(max_frames=500)
+        started_playback = False
+        try:
+            playback.push(pcm)
+            playback.finish_turn()
+            voice.play(playback)
+            started_playback = True
+            await self._wait_for_playback(voice, playback)
+        finally:
+            if started_playback:
+                try:
+                    voice.stop()
+                except Exception:
+                    log.warning("Fixed speech Discord playback cleanup failed")
+            playback.cleanup()
+
+    async def speak(self, voice, text):
+        cached = self._cached(text)
+        if cached is not None:
+            log.info("Fixed speech audio cache hit")
+            await self._play_cached(voice, cached)
+            return
+        log.info("Fixed speech audio cache miss")
+        provider = self.factory("gemini", self.settings)
+        playback = PCMPlayback(max_frames=500)
+        started_playback = False
+        received_audio = False
+        rendered = bytearray()
+        converter = PCMConverter(24000, 48000, target_channels=2)
+        try:
+            await provider.connect()
+            voice.play(playback)
+            started_playback = True
+            await provider.send_text(text)
+            async with asyncio.timeout(min(30.0, self.settings.receive_timeout)):
+                async for event in provider.receive_audio():
+                    if event.kind == "audio":
+                        if event.sample_rate != converter.source_rate:
+                            converter = PCMConverter(
+                                event.sample_rate, 48000, target_channels=2,
+                            )
+                        if len(event.data) > 1024 * 1024:
+                            raise BufferError("Oversized provider audio")
+                        converted = converter.convert(event.data)
+                        playback.push(converted)
+                        rendered.extend(converted)
+                        received_audio = True
+                    elif event.kind in {"interrupted", "speech_started"}:
+                        raise ProviderError("speech_interrupted")
+                    elif event.kind == "turn_complete":
+                        break
+            if not received_audio:
+                raise ProviderError("empty_audio")
+            playback.finish_turn()
+            self._remember(text, bytes(rendered))
+            await self._wait_for_playback(voice, playback)
+        finally:
+            if started_playback:
+                try:
+                    voice.stop()
+                except Exception:
+                    log.warning("Fixed speech Discord playback cleanup failed")
+            playback.cleanup()
+            try:
+                await provider.close()
+            except Exception:
+                log.warning("Fixed speech provider cleanup failed")
 
 
 class VoiceSession:
